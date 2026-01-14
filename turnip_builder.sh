@@ -5,23 +5,22 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
-# ADICIONADO: 'patch' na lista de dependências
-deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator patch"
+# Dependências
+deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator"
 workdir="$(pwd)/turnip_workdir"
 
 # --- CONFIGURAÇÃO ---
 ndkver="android-ndk-r28"
 target_sdk="36"
 
-# BASE: Rob Clark (Bleeding Edge)
-base_repo="https://gitlab.freedesktop.org/robclark/mesa.git"
-base_branch="tu/gen8"
+# 1. BASE: Mesa Oficial
+base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
-# HACKS: Whitebelyash (A830 Support)
+# 2. HACKS: Whitebelyash (Gen8 patches)
 hacks_repo="https://github.com/whitebelyash/mesa-tu8.git"
-hacks_branch="gen8-hacks"
+hacks_branch="gen8"
 
-# Commit que quebra o DXVK (Vamos reverter ele)
+# Commit que quebra o DXVK
 bad_commit="2f0ea1c6"
 
 commit_hash=""
@@ -38,7 +37,7 @@ check_deps(){
 		fi
 	done
 	if [ "$missing" == "1" ]; then
-		echo "Please install missing dependencies (ex: sudo apt install glslang-tools python3-pip patch ...)." && exit 1
+		echo "Please install missing dependencies." && exit 1
 	fi
     
 	echo "Updating Meson via pip..."
@@ -63,138 +62,186 @@ prepare_source(){
 	cd "$workdir"
 	if [ -d mesa ]; then rm -rf mesa; fi
 	
-    # 1. Clona BASE (Rob Clark - Último Commit)
-    echo "Cloning Base: $base_repo ($base_branch)..."
-	git clone --branch "$base_branch" "$base_repo" mesa
+    # 1. Clona Mesa Oficial
+    echo "Cloning Official Mesa..."
+	git clone --depth 100 "$base_repo" mesa
 	cd mesa
     
-    echo -e "${green}Current Rob Clark Commit:${nocolor}"
-    git log -1 --format="%H - %cd - %s"
-
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # 2. Prepara os HACKS
+    # 2. FETCH DA MR 39167 (Rob Clark - Elite Support)
+    echo -e "${green}Fetching Rob Clark MR 39167 (Gen8 Support)...${nocolor}"
+    git fetch "$base_repo" refs/merge-requests/39167/head:mr-39167
+    git checkout mr-39167
+    
+    echo -e "${green}Base Commit (MR 39167):${nocolor}"
+    git log -1 --format="%H - %cd - %s"
+
+    # 3. MERGE DOS HACKS
     echo "Fetching Hacks from: $hacks_repo..."
     git remote add hacks "$hacks_repo"
     git fetch hacks "$hacks_branch"
     
-    # 3. SMART MERGE HACKS
     echo "Attempting Merge Hacks..."
     if ! git merge --no-edit "hacks/$hacks_branch" --allow-unrelated-histories; then
-        echo -e "${red}Merge Conflict detected! Resolving intelligently...${nocolor}"
+        echo -e "${red}Merge Conflict detected! Resolving by accepting Hacks...${nocolor}"
         git checkout --theirs .
         git add .
-        git commit -m "Auto-resolved conflicts by accepting Hacks"
+        git commit -m "Auto-resolved conflicts by accepting Hacks over MR 39167"
         echo -e "${green}Conflicts resolved. Hacks applied successfully.${nocolor}"
     fi
 
-    # --- PATCH A710/A720 (Unofficial) ---
-    echo -e "${green}Applying A710/A720 Support Patch...${nocolor}"
-cat << 'EOF_A7XX' > a7xx_support.patch
-diff -uNr mesa/src/freedreno/common/freedreno_devices.py mesa1/src/freedreno/common/freedreno_devices.py
---- mesa/src/freedreno/common/freedreno_devices.py	2025-11-26 13:11:08.662398622 +0200
-+++ mesa1/src/freedreno/common/freedreno_devices.py	2025-12-01 01:20:38.270885899 +0200
-@@ -1139,6 +1139,46 @@
-     ))
- 
- add_gpus([
-+        GPUId(chip_id=0x07010000, name="FD710"), # KGSL, no speedbin data
-+        GPUId(chip_id=0xffff07010000, name="FD710"), # Default no-speedbin fallback
-+    ], A6xxGPUInfo(
-+        CHIP.A7XX,
-+        [a7xx_base, a7xx_gen1],
-+        num_ccu = 4,
-+        tile_align_w = 64,
-+        tile_align_h = 32,
-+        tile_max_w = 1024,
-+        tile_max_h = 1024,
-+        num_vsc_pipes = 32,
-+        cs_shared_mem_size = 32 * 1024,
-+        wave_granularity = 2,
-+        fibers_per_sp = 128 * 2 * 16,
-+        highest_bank_bit = 16,
-+        magic_regs = a730_magic_regs,
-+        raw_magic_regs = a730_raw_magic_regs,
-+    ))
-+
-+add_gpus([
-+        GPUId(chip_id=0x43020000, name="FD720"), # KGSL, no speedbin data
-+        GPUId(chip_id=0xffff043020000, name="FD720"), # Default no-speedbin fallback
-+    ], A6xxGPUInfo(
-+        CHIP.A7XX,
-+        [a7xx_base, a7xx_gen1],
-+        num_ccu = 4,
-+        tile_align_w = 64,
-+        tile_align_h = 32,
-+        tile_max_w = 1024,
-+        tile_max_h = 1024,
-+        num_vsc_pipes = 32,
-+        cs_shared_mem_size = 32 * 1024,
-+        wave_granularity = 2,
-+        fibers_per_sp = 128 * 2 * 16,
-+        highest_bank_bit = 16,
-+        magic_regs = a730_magic_regs,
-+        raw_magic_regs = a730_raw_magic_regs,
-+    ))
-+
-+add_gpus([
-         GPUId(chip_id=0x07030001, name="FD730"), # KGSL, no speedbin data
-         GPUId(chip_id=0xffff07030001, name="FD730"), # Default no-speedbin fallback
-     ], A6xxGPUInfo(
-diff -uNr mesa/src/freedreno/drm-shim/freedreno_noop.c mesa1/src/freedreno/drm-shim/freedreno_noop.c
---- mesa/src/freedreno/drm-shim/freedreno_noop.c	2025-11-26 13:11:08.666398622 +0200
-+++ mesa1/src/freedreno/drm-shim/freedreno_noop.c	2025-12-01 01:21:57.954885869 +0200
-@@ -262,6 +262,16 @@
-       .gmem_size = 128 * 1024,
-    },
-    {
-+      .gpu_id = 710,
-+      .chip_id = 0x07010000,
-+      .gmem_size = 2 * 1024 * 1024,
-+   },
-+   {
-+      .gpu_id = 720,
-+      .chip_id = 0x43020000,
-+      .gmem_size = 2 * 1024 * 1024,
-+   },
-+   {
-       .gpu_id = 730,
-       .chip_id = 0x07030001,
-       .gmem_size = 2 * 1024 * 1024,
-diff -uNr mesa/src/freedreno/vulkan/tu_cmd_buffer.cc mesa1/src/freedreno/vulkan/tu_cmd_buffer.cc
---- mesa/src/freedreno/vulkan/tu_cmd_buffer.cc	2025-12-01 01:16:01.142886005 +0200
-+++ mesa1/src/freedreno/vulkan/tu_cmd_buffer.cc	2025-12-01 01:24:06.186885820 +0200
-@@ -1314,7 +1314,7 @@
-       return true;
-    }
- 
--   if (TU_DEBUG(GMEM))
-+
-       return false;
- 
-    bool use_sysmem = tu_autotune_use_bypass(&cmd->device->autotune,
-EOF_A7XX
-    
-    # Aplica o patch
-    if patch -p1 < a7xx_support.patch; then
-        echo -e "${green}A710/A720 Patch applied successfully!${nocolor}"
-    else
-        echo -e "${red}A710/A720 Patch FAILED! Attempting git apply...${nocolor}"
-        git apply -p1 --ignore-space-change --ignore-whitespace a7xx_support.patch || true
-    fi
-
-    # --- CORREÇÃO DE SINTAXE (A825 MISSING COMMA) ---
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
 
-    # 4. REVERT DO COMMIT QUE MATA O DXVK
-    echo -e "${green}Attempting to REVERT commit $bad_commit (Enable GS/Tess)...${nocolor}"
+    # 4. APLICAÇÃO DO PATCH ASYNC (OPTIMIZED POLLING)
+    echo -e "${green}Injecting Optimized Semaphore Async (Wait Many)...${nocolor}"
     
-    if git revert --no-edit "$bad_commit"; then
-        echo -e "${green}SUCCESS: Reverted GS/Tess disable! DXVK should work.${nocolor}"
+    # CÓDIGO: Usa Polling (micro-sleep) para evitar stutters
+cat << 'EOF_ASYNC' > new_wait_many.c
+static VkResult
+vk_sync_timeline_wait_many(struct vk_device *device,
+                           uint32_t count,
+                           const struct vk_sync_wait *waits,
+                           enum vk_sync_wait_flags wait_flags,
+                           uint64_t abs_timeout_ns)
+{
+    struct timespec abs_timeout_ts;
+    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
+
+    /* Otimização: Se for apenas 1 timeline, usamos a espera nativa na condição (sem CPU overhead) */
+    if (count == 1) {
+       struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[0].sync);
+       return vk_sync_timeline_wait(device, &timeline->sync, waits[0].wait_value, wait_flags, abs_timeout_ns);
+    }
+
+    /* Otimização: Se forem vários, usamos polling com micro-sleep para evitar travamentos no semáforo errado */
+    uint32_t i;
+    while (true) {
+        bool any_ready = false;
+        
+        /* 1. Check ALL timelines */
+        for (i = 0; i < count; i++) {
+            struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[i].sync);
+            uint64_t wait_value = waits[i].wait_value;
+            struct vk_sync_timeline_state *state = timeline->state;
+
+            mtx_lock(&state->mutex);
+            if (state->highest_past >= wait_value) {
+                any_ready = true;
+                mtx_unlock(&state->mutex);
+                if (wait_flags & VK_SYNC_WAIT_ANY)
+                    return VK_SUCCESS;
+                continue;
+            }
+
+            struct vk_sync_timeline_point *point = NULL;
+            list_for_each_entry(struct vk_sync_timeline_point, p,
+                                &state->pending_points, link) {
+                if (p->value >= wait_value) {
+                    vk_sync_timeline_ref_point_locked(p);
+                    point = p;
+                    break;
+                }
+            }
+
+            if (!point) {
+                mtx_unlock(&state->mutex);
+                continue;
+            }
+
+            /* Tenta esperar neste ponto específico sem bloquear */
+            mtx_unlock(&state->mutex);
+            VkResult r = vk_sync_wait(device, &point->sync, 0,
+                                      VK_SYNC_WAIT_COMPLETE,
+                                      0); /* Timeout 0 = Check instantâneo */
+            
+            mtx_lock(&state->mutex);
+            vk_sync_timeline_unref_point_locked(device, state, point);
+            
+            if (r == VK_SUCCESS) {
+                 vk_sync_timeline_complete_point_locked(device, state, point);
+                 any_ready = true;
+                 mtx_unlock(&state->mutex);
+                 if (wait_flags & VK_SYNC_WAIT_ANY) return VK_SUCCESS;
+                 continue;
+            }
+            mtx_unlock(&state->mutex);
+        }
+
+        /* 2. Verificação Final do Loop */
+        if (!(wait_flags & VK_SYNC_WAIT_ANY)) {
+            bool all_ready = true;
+            for (i = 0; i < count; i++) {
+                struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[i].sync);
+                if (timeline->state->highest_past < waits[i].wait_value) {
+                    all_ready = false;
+                    break;
+                }
+            }
+            if (all_ready) return VK_SUCCESS;
+        }
+
+        /* 3. Check Timeout Global */
+        struct timespec now;
+        timespec_get(&now, TIME_UTC);
+        if (timespec_to_nsec(&now) >= abs_timeout_ns) {
+            return VK_TIMEOUT;
+        }
+
+        /* 4. POLLING: Dorme 20us (micro-sleep) para liberar CPU mas voltar rápido */
+        struct timespec poll_sleep = {0, 20000}; /* 20000ns = 20us */
+        thrd_sleep(&poll_sleep, NULL);
+    }
+}
+EOF_ASYNC
+
+    # Script Perl para INJETAR no FINAL do arquivo (antes de get_type)
+    perl -i -0777 -e '
+        my $filename = "src/vulkan/runtime/vk_sync_timeline.c";
+        open(my $fh, "<", $filename) or die "Cannot open $filename";
+        my $content = do { local $/; <$fh> };
+        close($fh);
+
+        open(my $nfh, "<", "new_wait_many.c") or die "Cannot read new function";
+        my $new_func = do { local $/; <$nfh> };
+        close($nfh);
+
+        # Remove versão antiga se existir
+        $content =~ s/static VkResult\s+vk_sync_timeline_wait_many.*?^}//ms;
+
+        # Injeta ANTES de vk_sync_timeline_get_type
+        if ($content =~ s/(struct vk_sync_timeline_type\s+vk_sync_timeline_get_type)/$new_func\n\n$1/) {
+             print "Function injected correctly.\n";
+             # Conecta na struct
+             if ($content =~ s/(\.wait\s*=\s*vk_sync_timeline_wait,)/$1\n         .wait_many = vk_sync_timeline_wait_many, /) {
+                 print "Struct hook connected.\n";
+             }
+        } else {
+             print "ERROR: Injection point not found.\n";
+             exit 1;
+        }
+
+        open($fh, ">", $filename) or die "Cannot write back";
+        print $fh $content;
+        close($fh);
+    '
+
+    if grep -q "vk_sync_timeline_wait_many" src/vulkan/runtime/vk_sync_timeline.c; then
+        echo -e "${green}SUCCESS: Optimized Async Patch Applied!${nocolor}"
     else
-        echo -e "${red}Git revert failed (hash changed?). Trying manual SED patch...${nocolor}"
+        echo -e "${red}ERROR: Failed to inject Async Patch.${nocolor}"
+        exit 1
+    fi
+
+    # 5. DXVK FIX (GS/Tessellation)
+    echo -e "${green}Applying DXVK Fixes...${nocolor}"
+    
+    if git revert --no-edit "$bad_commit" 2>/dev/null; then
+        echo -e "${green}SUCCESS: Reverted commit $bad_commit via Git.${nocolor}"
+    else
+        echo -e "${red}Git revert failed. Applying MANUAL patch...${nocolor}"
         git revert --abort || true
         # Fallback manual para reativar GS/Tess
         find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip != 8)//g'
@@ -203,7 +250,7 @@ EOF_A7XX
     fi
 
     # --- SPIRV Manual ---
-    echo "Manually cloning dependencies..."
+    echo "Cloning SPIRV dependencies..."
     mkdir -p subprojects
     cd subprojects
     rm -rf spirv-tools spirv-headers
@@ -212,7 +259,7 @@ EOF_A7XX
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="RobClark-A7xx-Unofficial"
+	version_str="Turnip-Async-Polled"
 	cd "$workdir"
 }
 
@@ -247,7 +294,7 @@ endian = 'little'
 EOF
 
 	cd "$source_dir"
-	# CORREÇÃO CRÍTICA: Desabilita "Treat Warnings as Errors"
+	# Desabilita WError para passar avisos de formatação
 	export CFLAGS="-D__ANDROID__ -Wno-error"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error"
 
@@ -292,19 +339,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-A7xx-Unofficial-${short_hash}"
+	local meta_name="Turnip-OptimizedAsync-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Gen8 + A710/A720 Unofficial Support. Commit $short_hash",
+  "description": "Turnip Optimized: Gen8 (RobClark) + Async Semaphore Polling. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-A7xx-Unofficial-${short_hash}.zip"
+	local zip_name="Turnip-OptimizedAsync-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -315,9 +362,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-A7xx-${date_tag}-${short_hash}" > tag
-    echo "Turnip A7xx (A710/A720 Support) - ${date_tag}" > release
-    echo "Automated Turnip Build. Features: SDK 36, Hacks, DXVK Fix, A710/A720 Unofficial Support." > description
+    echo "Turnip-Async-Polled-${date_tag}-${short_hash}" > tag
+    echo "Turnip Optimized (Async Polling) - ${date_tag}" > release
+    echo "Features: RobClark Base, Low-Latency Async Semaphore, DXVK Fix." > description
 }
 
 check_deps

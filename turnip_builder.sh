@@ -96,9 +96,10 @@ prepare_source(){
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
 
-    # CORREÇÃO NOVA: Remove a linha que causa AttributeError (registro inexistente)
-    echo "Removing undefined register REG_A8XX_GRAS_UNKNOWN_8228..."
-    sed -i '/REG_A8XX_GRAS_UNKNOWN_8228/d' src/freedreno/common/freedreno_devices.py
+    # CORREÇÃO DEFINITIVA: Remove TODAS as linhas com REG_A8XX_GRAS_UNKNOWN_
+    # Isso evita erro no 8228, 8229, 822A, etc.
+    echo "Removing ALL undefined registers (REG_A8XX_GRAS_UNKNOWN_*)..."
+    sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
 
 
     # 4. APLICAÇÃO DO PATCH ASYNC (AGGRESSIVE POLLING)

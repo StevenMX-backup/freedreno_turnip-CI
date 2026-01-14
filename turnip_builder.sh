@@ -20,7 +20,7 @@ base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 hacks_repo="https://github.com/whitebelyash/mesa-tu8.git"
 hacks_branch="gen8"
 
-# Commit que quebra o DXVK
+# Commit que quebra o DXVK (Geometry/Tessellation)
 bad_commit="2f0ea1c6"
 
 commit_hash=""
@@ -78,7 +78,8 @@ prepare_source(){
     echo -e "${green}Base Commit (MR 39167):${nocolor}"
     git log -1 --format="%H - %cd - %s"
 
-    # 3. MERGE DOS HACKS
+    # 3. MERGE DOS HACKS (Whitebelyash Gen8)
+    # AQUI ESTÁ A CHAVE: Confiamos no código dele para Timeline Semaphores.
     echo "Fetching Hacks from: $hacks_repo..."
     git remote add hacks "$hacks_repo"
     git fetch hacks "$hacks_branch"
@@ -92,162 +93,23 @@ prepare_source(){
         echo -e "${green}Conflicts resolved. Hacks applied successfully.${nocolor}"
     fi
 
-    # --- CORREÇÕES DE SINTAXE E ERROS DE BUILD ---
+    # --- CORREÇÕES OBRIGATÓRIAS DE BUILD ---
+    
+    # 1. Fix Syntax Error (Missing Comma)
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
 
-    # Remove registros indefinidos que causam erro de build
+    # 2. Fix AttributeError (Registros indefinidos)
+    # Remove qualquer referência a REG_A8XX_GRAS_UNKNOWN_ para não quebrar a build
     echo "Removing ALL undefined registers (REG_A8XX_GRAS_UNKNOWN_*)..."
     sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
 
+    # --- SEMAPHORE PATCH: REMOVIDO ---
+    # Não estamos mais injetando código manual aqui. 
+    # Usamos o que veio no merge dos hacks.
+    echo -e "${green}Skipping manual Semaphore patches (Trusting Whitebelyash Gen8 implementation)...${nocolor}"
 
-    # 4. APLICAÇÃO DO PATCH HYBRID SPIN-LOOP
-    echo -e "${green}Injecting Hybrid Spin-Loop (Zero Latency)...${nocolor}"
-    
-cat << 'EOF_ASYNC' > new_wait_many.c
-static VkResult
-vk_sync_timeline_wait_many(struct vk_device *device,
-                           uint32_t count,
-                           const struct vk_sync_wait *waits,
-                           enum vk_sync_wait_flags wait_flags,
-                           uint64_t abs_timeout_ns)
-{
-    struct timespec abs_timeout_ts;
-    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
-
-    /* Otimização: Se for apenas 1 timeline, usamos a espera nativa */
-    if (count == 1) {
-       struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[0].sync);
-       return vk_sync_timeline_wait(device, &timeline->sync, waits[0].wait_value, wait_flags, abs_timeout_ns);
-    }
-
-    uint32_t i;
-    /* CONTADOR DE SPIN: Primeiras 5000 voltas são "Busy Wait" (Zero Latency) */
-    int spin_count = 0;
-    const int SPIN_LIMIT = 5000;
-
-    while (true) {
-        bool any_ready = false;
-        
-        /* 1. Check ALL timelines */
-        for (i = 0; i < count; i++) {
-            struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[i].sync);
-            uint64_t wait_value = waits[i].wait_value;
-            struct vk_sync_timeline_state *state = timeline->state;
-
-            mtx_lock(&state->mutex);
-            if (state->highest_past >= wait_value) {
-                any_ready = true;
-                mtx_unlock(&state->mutex);
-                if (wait_flags & VK_SYNC_WAIT_ANY)
-                    return VK_SUCCESS;
-                continue;
-            }
-
-            struct vk_sync_timeline_point *point = NULL;
-            list_for_each_entry(struct vk_sync_timeline_point, p,
-                                &state->pending_points, link) {
-                if (p->value >= wait_value) {
-                    vk_sync_timeline_ref_point_locked(p);
-                    point = p;
-                    break;
-                }
-            }
-
-            if (!point) {
-                mtx_unlock(&state->mutex);
-                continue;
-            }
-
-            /* Tenta esperar neste ponto específico sem bloquear */
-            mtx_unlock(&state->mutex);
-            VkResult r = vk_sync_wait(device, &point->sync, 0,
-                                      VK_SYNC_WAIT_COMPLETE,
-                                      0); /* Timeout 0 = Check instantâneo */
-            
-            mtx_lock(&state->mutex);
-            vk_sync_timeline_unref_point_locked(device, state, point);
-            
-            if (r == VK_SUCCESS) {
-                 vk_sync_timeline_complete_point_locked(device, state, point);
-                 any_ready = true;
-                 mtx_unlock(&state->mutex);
-                 if (wait_flags & VK_SYNC_WAIT_ANY) return VK_SUCCESS;
-                 continue;
-            }
-            mtx_unlock(&state->mutex);
-        }
-
-        /* 2. Verificação Final do Loop */
-        if (!(wait_flags & VK_SYNC_WAIT_ANY)) {
-            bool all_ready = true;
-            for (i = 0; i < count; i++) {
-                struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[i].sync);
-                if (timeline->state->highest_past < waits[i].wait_value) {
-                    all_ready = false;
-                    break;
-                }
-            }
-            if (all_ready) return VK_SUCCESS;
-        }
-
-        /* 3. Check Timeout Global */
-        struct timespec now;
-        timespec_get(&now, TIME_UTC);
-        if (timespec_to_nsec(&now) >= abs_timeout_ns) {
-            return VK_TIMEOUT;
-        }
-
-        /* 4. HYBRID WAIT: Spin first, Sleep later */
-        if (spin_count < SPIN_LIMIT) {
-            spin_count++;
-            /* sched_yield() ou apenas continue para Busy Loop agressivo */
-            /* 'continue' aqui faz a CPU rodar a 100% no loop, garantindo latência 0 */
-            continue; 
-        }
-
-        /* Se ainda não liberou após o spin, dorme 1us para não travar o OS */
-        struct timespec poll_sleep = {0, 1000}; 
-        thrd_sleep(&poll_sleep, NULL);
-    }
-}
-EOF_ASYNC
-
-    perl -i -0777 -e '
-        my $filename = "src/vulkan/runtime/vk_sync_timeline.c";
-        open(my $fh, "<", $filename) or die "Cannot open $filename";
-        my $content = do { local $/; <$fh> };
-        close($fh);
-
-        open(my $nfh, "<", "new_wait_many.c") or die "Cannot read new function";
-        my $new_func = do { local $/; <$nfh> };
-        close($nfh);
-
-        $content =~ s/static VkResult\s+vk_sync_timeline_wait_many.*?^}//ms;
-
-        if ($content =~ s/(struct vk_sync_timeline_type\s+vk_sync_timeline_get_type)/$new_func\n\n$1/) {
-             print "Function injected correctly.\n";
-             if ($content =~ s/(\.wait\s*=\s*vk_sync_timeline_wait,)/$1\n         .wait_many = vk_sync_timeline_wait_many, /) {
-                 print "Struct hook connected.\n";
-             }
-        } else {
-             print "ERROR: Injection point not found.\n";
-             exit 1;
-        }
-
-        open($fh, ">", $filename) or die "Cannot write back";
-        print $fh $content;
-        close($fh);
-    '
-
-    if grep -q "vk_sync_timeline_wait_many" src/vulkan/runtime/vk_sync_timeline.c; then
-        echo -e "${green}SUCCESS: Hybrid Spin-Loop Patch Applied!${nocolor}"
-    else
-        echo -e "${red}ERROR: Failed to inject Async Patch.${nocolor}"
-        exit 1
-    fi
-
-    # 5. DXVK FIX (GS/Tessellation)
+    # 5. DXVK FIX (GS/Tessellation) - ISSO AINDA É NECESSÁRIO
     echo -e "${green}Applying DXVK Fixes...${nocolor}"
     
     if git revert --no-edit "$bad_commit" 2>/dev/null; then
@@ -271,7 +133,7 @@ EOF_ASYNC
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-HybridSpin-CPU"
+	version_str="Turnip-PureHacks-CPU"
 	cd "$workdir"
 }
 
@@ -307,7 +169,8 @@ EOF
 
 	cd "$source_dir"
 	
-	# CPU FEATURES (OTIMIZAÇÃO DE EXTENSÕES)
+	# CPU FEATURES (MANTIDO: OTIMIZAÇÃO DE EXTENSÕES/SHADERS)
+	# Isso não afeta a lógica do driver, apenas a velocidade do código gerado.
 	CPU_FLAGS="-mcpu=cortex-a76+crypto+crc+aes+sha2 -O3 -flto"
 
 	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
@@ -354,19 +217,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-HybridSpin-CPU-${short_hash}"
+	local meta_name="Turnip-PureHacks-CPU-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Hybrid Spin: Zero Latency Polling + O3. Commit $short_hash",
+  "description": "Turnip Pure Hacks (Gen8) + CPU Opts. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-HybridSpin-CPU-${short_hash}.zip"
+	local zip_name="Turnip-PureHacks-CPU-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -377,9 +240,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-HybridSpin-CPU-${date_tag}-${short_hash}" > tag
-    echo "Turnip Hybrid Spin (Zero Latency) - ${date_tag}" > release
-    echo "Performance Build: Hybrid Spin-Loop (5000 iters) + CPU Flags." > description
+    echo "Turnip-PureHacks-CPU-${date_tag}-${short_hash}" > tag
+    echo "Turnip Pure Hacks (CPU Optimized) - ${date_tag}" > release
+    echo "Clean Build: Whitebelyash Gen8 + CPU Flags (No manual Semaphore patches)." > description
 }
 
 check_deps

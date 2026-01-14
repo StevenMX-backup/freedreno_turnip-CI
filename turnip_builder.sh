@@ -96,14 +96,13 @@ prepare_source(){
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
 
-    # CORREÇÃO DEFINITIVA: Remove TODAS as linhas com REG_A8XX_GRAS_UNKNOWN_
-    # Isso evita erro no 8228, 8229, 822A, etc.
+    # Remove registros indefinidos que causam erro de build
     echo "Removing ALL undefined registers (REG_A8XX_GRAS_UNKNOWN_*)..."
     sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
 
 
-    # 4. APLICAÇÃO DO PATCH ASYNC (AGGRESSIVE POLLING)
-    echo -e "${green}Injecting Aggressive Async (1us Polling)...${nocolor}"
+    # 4. APLICAÇÃO DO PATCH HYBRID SPIN-LOOP
+    echo -e "${green}Injecting Hybrid Spin-Loop (Zero Latency)...${nocolor}"
     
 cat << 'EOF_ASYNC' > new_wait_many.c
 static VkResult
@@ -123,6 +122,10 @@ vk_sync_timeline_wait_many(struct vk_device *device,
     }
 
     uint32_t i;
+    /* CONTADOR DE SPIN: Primeiras 5000 voltas são "Busy Wait" (Zero Latency) */
+    int spin_count = 0;
+    const int SPIN_LIMIT = 5000;
+
     while (true) {
         bool any_ready = false;
         
@@ -195,7 +198,15 @@ vk_sync_timeline_wait_many(struct vk_device *device,
             return VK_TIMEOUT;
         }
 
-        /* 4. AGGRESSIVE POLLING: 1000ns (1us) de sono. */
+        /* 4. HYBRID WAIT: Spin first, Sleep later */
+        if (spin_count < SPIN_LIMIT) {
+            spin_count++;
+            /* sched_yield() ou apenas continue para Busy Loop agressivo */
+            /* 'continue' aqui faz a CPU rodar a 100% no loop, garantindo latência 0 */
+            continue; 
+        }
+
+        /* Se ainda não liberou após o spin, dorme 1us para não travar o OS */
         struct timespec poll_sleep = {0, 1000}; 
         thrd_sleep(&poll_sleep, NULL);
     }
@@ -230,7 +241,7 @@ EOF_ASYNC
     '
 
     if grep -q "vk_sync_timeline_wait_many" src/vulkan/runtime/vk_sync_timeline.c; then
-        echo -e "${green}SUCCESS: Aggressive Async Patch Applied!${nocolor}"
+        echo -e "${green}SUCCESS: Hybrid Spin-Loop Patch Applied!${nocolor}"
     else
         echo -e "${red}ERROR: Failed to inject Async Patch.${nocolor}"
         exit 1
@@ -260,7 +271,7 @@ EOF_ASYNC
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-Aggressive-CPU"
+	version_str="Turnip-HybridSpin-CPU"
 	cd "$workdir"
 }
 
@@ -343,19 +354,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-Aggressive-CPU-${short_hash}"
+	local meta_name="Turnip-HybridSpin-CPU-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Aggressive: CPU Features Enabled + Async Polling. Commit $short_hash",
+  "description": "Turnip Hybrid Spin: Zero Latency Polling + O3. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-Aggressive-CPU-${short_hash}.zip"
+	local zip_name="Turnip-HybridSpin-CPU-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -366,9 +377,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-Aggressive-CPU-${date_tag}-${short_hash}" > tag
-    echo "Turnip Aggressive (CPU Features + Async) - ${date_tag}" > release
-    echo "Performance Build: Cortex-A76+Crypto Flags + Aggressive Async Polling." > description
+    echo "Turnip-HybridSpin-CPU-${date_tag}-${short_hash}" > tag
+    echo "Turnip Hybrid Spin (Zero Latency) - ${date_tag}" > release
+    echo "Performance Build: Hybrid Spin-Loop (5000 iters) + CPU Flags." > description
 }
 
 check_deps

@@ -95,10 +95,9 @@ prepare_source(){
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
 
-    # 4. APLICAÇÃO DO PATCH ASYNC (OPTIMIZED POLLING)
-    echo -e "${green}Injecting Optimized Semaphore Async (Wait Many)...${nocolor}"
+    # 4. APLICAÇÃO DO PATCH ASYNC (AGGRESSIVE POLLING)
+    echo -e "${green}Injecting Aggressive Async (1us Polling)...${nocolor}"
     
-    # CÓDIGO: Usa Polling (micro-sleep) para evitar stutters
 cat << 'EOF_ASYNC' > new_wait_many.c
 static VkResult
 vk_sync_timeline_wait_many(struct vk_device *device,
@@ -110,13 +109,12 @@ vk_sync_timeline_wait_many(struct vk_device *device,
     struct timespec abs_timeout_ts;
     timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
 
-    /* Otimização: Se for apenas 1 timeline, usamos a espera nativa na condição (sem CPU overhead) */
+    /* Otimização: Se for apenas 1 timeline, usamos a espera nativa */
     if (count == 1) {
        struct vk_sync_timeline *timeline = to_vk_sync_timeline(waits[0].sync);
        return vk_sync_timeline_wait(device, &timeline->sync, waits[0].wait_value, wait_flags, abs_timeout_ns);
     }
 
-    /* Otimização: Se forem vários, usamos polling com micro-sleep para evitar travamentos no semáforo errado */
     uint32_t i;
     while (true) {
         bool any_ready = false;
@@ -190,14 +188,13 @@ vk_sync_timeline_wait_many(struct vk_device *device,
             return VK_TIMEOUT;
         }
 
-        /* 4. POLLING: Dorme 20us (micro-sleep) para liberar CPU mas voltar rápido */
-        struct timespec poll_sleep = {0, 20000}; /* 20000ns = 20us */
+        /* 4. AGGRESSIVE POLLING: 1000ns (1us) de sono. */
+        struct timespec poll_sleep = {0, 1000}; 
         thrd_sleep(&poll_sleep, NULL);
     }
 }
 EOF_ASYNC
 
-    # Script Perl para INJETAR no FINAL do arquivo (antes de get_type)
     perl -i -0777 -e '
         my $filename = "src/vulkan/runtime/vk_sync_timeline.c";
         open(my $fh, "<", $filename) or die "Cannot open $filename";
@@ -208,13 +205,10 @@ EOF_ASYNC
         my $new_func = do { local $/; <$nfh> };
         close($nfh);
 
-        # Remove versão antiga se existir
         $content =~ s/static VkResult\s+vk_sync_timeline_wait_many.*?^}//ms;
 
-        # Injeta ANTES de vk_sync_timeline_get_type
         if ($content =~ s/(struct vk_sync_timeline_type\s+vk_sync_timeline_get_type)/$new_func\n\n$1/) {
              print "Function injected correctly.\n";
-             # Conecta na struct
              if ($content =~ s/(\.wait\s*=\s*vk_sync_timeline_wait,)/$1\n         .wait_many = vk_sync_timeline_wait_many, /) {
                  print "Struct hook connected.\n";
              }
@@ -229,7 +223,7 @@ EOF_ASYNC
     '
 
     if grep -q "vk_sync_timeline_wait_many" src/vulkan/runtime/vk_sync_timeline.c; then
-        echo -e "${green}SUCCESS: Optimized Async Patch Applied!${nocolor}"
+        echo -e "${green}SUCCESS: Aggressive Async Patch Applied!${nocolor}"
     else
         echo -e "${red}ERROR: Failed to inject Async Patch.${nocolor}"
         exit 1
@@ -259,7 +253,7 @@ EOF_ASYNC
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-Async-Polled"
+	version_str="Turnip-Aggressive-CPU"
 	cd "$workdir"
 }
 
@@ -294,9 +288,14 @@ endian = 'little'
 EOF
 
 	cd "$source_dir"
-	# Desabilita WError para passar avisos de formatação
-	export CFLAGS="-D__ANDROID__ -Wno-error"
-	export CXXFLAGS="-D__ANDROID__ -Wno-error"
+	
+	# CPU FEATURES (OTIMIZAÇÃO DE EXTENSÕES)
+	# -mcpu=cortex-a76: Base para Adreno 6xx/7xx modernos.
+	# +crypto +crc +aes +sha2: Habilita extensões aceleradas por hardware.
+	CPU_FLAGS="-mcpu=cortex-a76+crypto+crc+aes+sha2 -O3 -flto"
+
+	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
+	export CXXFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
 
 	meson setup "$build_dir" --cross-file "$cross_file" \
 		-Dbuildtype=release \
@@ -339,19 +338,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-OptimizedAsync-${short_hash}"
+	local meta_name="Turnip-Aggressive-CPU-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Optimized: Gen8 (RobClark) + Async Semaphore Polling. Commit $short_hash",
+  "description": "Turnip Aggressive: CPU Features Enabled + Async Polling. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-OptimizedAsync-${short_hash}.zip"
+	local zip_name="Turnip-Aggressive-CPU-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -362,9 +361,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-Async-Polled-${date_tag}-${short_hash}" > tag
-    echo "Turnip Optimized (Async Polling) - ${date_tag}" > release
-    echo "Features: RobClark Base, Low-Latency Async Semaphore, DXVK Fix." > description
+    echo "Turnip-Aggressive-CPU-${date_tag}-${short_hash}" > tag
+    echo "Turnip Aggressive (CPU Features + Async) - ${date_tag}" > release
+    echo "Performance Build: Cortex-A76+Crypto Flags + Aggressive Async Polling." > description
 }
 
 check_deps

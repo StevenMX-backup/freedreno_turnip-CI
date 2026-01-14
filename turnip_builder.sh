@@ -92,8 +92,14 @@ prepare_source(){
         echo -e "${green}Conflicts resolved. Hacks applied successfully.${nocolor}"
     fi
 
+    # --- CORREÇÕES DE SINTAXE E ERROS DE BUILD ---
     echo "Fixing freedreno_devices.py syntax..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
+
+    # CORREÇÃO NOVA: Remove a linha que causa AttributeError (registro inexistente)
+    echo "Removing undefined register REG_A8XX_GRAS_UNKNOWN_8228..."
+    sed -i '/REG_A8XX_GRAS_UNKNOWN_8228/d' src/freedreno/common/freedreno_devices.py
+
 
     # 4. APLICAÇÃO DO PATCH ASYNC (AGGRESSIVE POLLING)
     echo -e "${green}Injecting Aggressive Async (1us Polling)...${nocolor}"
@@ -290,8 +296,6 @@ EOF
 	cd "$source_dir"
 	
 	# CPU FEATURES (OTIMIZAÇÃO DE EXTENSÕES)
-	# -mcpu=cortex-a76: Base para Adreno 6xx/7xx modernos.
-	# +crypto +crc +aes +sha2: Habilita extensões aceleradas por hardware.
 	CPU_FLAGS="-mcpu=cortex-a76+crypto+crc+aes+sha2 -O3 -flto"
 
 	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"

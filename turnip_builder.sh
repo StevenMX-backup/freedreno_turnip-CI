@@ -51,22 +51,48 @@ prepare_source(){
 	cd "$workdir"
 	if [ -d mesa ]; then rm -rf mesa; fi
 	
-    echo "Cloning Official Mesa Main..."
-	git clone --depth 100 "$base_repo" mesa
+    # Configurações do Git para evitar erro HTTP 503 / RPC Failed
+    git config --global http.postBuffer 1048576000
+    git config --global http.lowSpeedLimit 0
+    git config --global http.lowSpeedTime 999999
+
+    echo "Cloning Official Mesa Main (Robust Mode)..."
+    
+    # Tentativa de clone com retry e otimização de tamanho (Blobless clone)
+    # --filter=blob:none reduz drasticamente o tamanho do download
+    count=0
+    until [ "$count" -ge 5 ]; do
+        if git clone --depth 1 --filter=blob:none "$base_repo" mesa; then
+            break
+        fi
+        echo -e "${red}Clone failed (HTTP 503). Retrying in 5 seconds... ($((count+1))/5)${nocolor}"
+        count=$((count+1))
+        rm -rf mesa
+        sleep 5
+    done
+
+    if [ ! -d "mesa" ]; then
+        echo -e "${red}CRITICAL: Failed to clone Mesa after 5 attempts.${nocolor}"
+        exit 1
+    fi
+
 	cd mesa
     
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO PYTHON SEGURA (FIXED) ===
+    # === INJEÇÃO PYTHON SEGURA (FIXED REGEX + 50k SPIN) ===
     echo -e "${green}Injecting Smart Spin Logic (Safe Replacement)...${nocolor}"
     
 cat << 'EOF_PYTHON' > inject_smart_wait.py
 import re
 import sys
 
-# Definimos a função INTEIRA para substituir, garantindo que a sintaxe fique correta.
-# Inclui a lógica de Spin de 50k ciclos (0.5ms) com Yield.
+# Função substituta completa.
+# Inclui:
+# 1. Busca eficiente (Fast Path)
+# 2. Spin Loop de 50k iterações com yield (Performance Path)
+# 3. Fallback seguro
 
 NEW_FUNCTION = r'''
 static VkResult
@@ -79,7 +105,7 @@ vk_sync_timeline_wait_locked(struct vk_device *device,
    struct timespec abs_timeout_ts;
    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
 
-   /* 1. LÓGICA HÍBRIDA: Busca o ponto exato na lista (Fast Path) */
+   /* 1. FAST PATH: Busca direta do ponto na lista */
    while (state->highest_past < wait_value) {
       struct vk_sync_timeline_point *point = NULL;
 
@@ -92,7 +118,7 @@ vk_sync_timeline_wait_locked(struct vk_device *device,
          }
       }
 
-      /* Se não achou o ponto, ele não foi submetido. Dorme no Kernel. */
+      /* Se point == NULL, o sinal ainda não foi submetido. Wait passivo. */
       if (!point) {
          int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
                                              &abs_timeout_ts);
@@ -105,13 +131,12 @@ vk_sync_timeline_wait_locked(struct vk_device *device,
          continue;
       }
 
-      /* 2. SPIN WAIT (Performance Path) */
-      /* Soltamos o mutex global para permitir que a GPU sinalize o ponto */
+      /* 2. SPIN WAIT: Solta o mutex e gira na CPU (0.5ms) */
       mtx_unlock(&state->mutex);
 
       VkResult result = VK_NOT_READY;
 
-      /* 50.000 iterações = Aprox 0.5ms. Ideal para segurar frames de 1000fps+ */
+      /* 50.000 iterações com yield para não travar o OS */
       for (int i = 0; i < 50000; i++) {
           result = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
           if (result == VK_SUCCESS) break;
@@ -121,15 +146,14 @@ vk_sync_timeline_wait_locked(struct vk_device *device,
           #endif
       }
 
-      /* 3. FALLBACK */
-      /* Se o spin falhar, dorme de verdade */
+      /* 3. FALLBACK: Se demorar demais, dorme */
       if (result != VK_SUCCESS) {
           result = vk_sync_wait(device, &point->sync, 0,
                                 VK_SYNC_WAIT_COMPLETE,
                                 abs_timeout_ns);
       }
 
-      /* Retoma o lock para limpar o ponto */
+      /* Retoma o lock */
       mtx_lock(&state->mutex);
       vk_sync_timeline_unref_point_locked(device, state, point);
 
@@ -152,26 +176,25 @@ try:
     with open(file_path, 'r') as f:
         content = f.read()
 
-    # ESTRATÉGIA SEGURA:
-    # Substituímos tudo desde a definição de 'vk_sync_timeline_wait_locked'
-    # ATÉ (mas sem incluir) a definição da próxima função 'vk_sync_timeline_wait'.
-    # Isso impede que o regex "coma" a função de baixo.
-
+    # Regex preciso:
+    # Captura a função vk_sync_timeline_wait_locked até o início da próxima função.
+    # Isso evita deletar código vizinho.
+    
     pattern = re.compile(
         r'(static VkResult\s+vk_sync_timeline_wait_locked\s*\(.*?\).*?)(static VkResult\s+vk_sync_timeline_wait)', 
         re.DOTALL
     )
 
     if pattern.search(content):
-        # Substitui o Grupo 1 (a função antiga) pela NEW_FUNCTION, mantendo o Grupo 2 (a função seguinte)
+        # Substitui o grupo 1 (função antiga) pelo NEW_FUNCTION, mantendo o grupo 2
         new_content = pattern.sub(NEW_FUNCTION + r'\n\n\2', content)
         with open(file_path, 'w') as f:
             f.write(new_content)
-        print("SUCCESS: Function replaced cleanly without damaging neighbors.")
+        print("SUCCESS: Function replaced safely via Python.")
     else:
-        print("ERROR: Could not locate function boundaries.")
+        print("ERROR: Could not find function boundaries.")
         # Debug:
-        print(content[:500])
+        print(content[:300])
         sys.exit(1)
 
 except Exception as e:
@@ -186,16 +209,34 @@ EOF_PYTHON
         exit 1
     fi
 
-    # Dependências SPIRV
+    # Dependências SPIRV (Com retry também)
     mkdir -p subprojects
     cd subprojects
     rm -rf spirv-tools spirv-headers
-    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools
-    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
+    
+    echo "Cloning SPIRV Tools..."
+    count=0
+    until [ "$count" -ge 5 ]; do
+        if git clone --depth 1 --filter=blob:none https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools; then break; fi
+        echo "Retrying SPIRV-Tools..."
+        rm -rf spirv-tools
+        count=$((count+1))
+        sleep 3
+    done
+
+    echo "Cloning SPIRV Headers..."
+    count=0
+    until [ "$count" -ge 5 ]; do
+        if git clone --depth 1 --filter=blob:none https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers; then break; fi
+        echo "Retrying SPIRV-Headers..."
+        rm -rf spirv-headers
+        count=$((count+1))
+        sleep 3
+    done
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-SmartSpin-50k-Fixed"
+	version_str="Turnip-SmartSpin-50k-GitFixed"
 	cd "$workdir"
 }
 
@@ -235,7 +276,6 @@ EOF
     cd "$source_dir"
     rm -rf "$build_dir"
     
-    # Meson Setup Corrigido
 	meson setup "$build_dir" . --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
@@ -277,19 +317,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-SmartSpin-50k-Fixed-${short_hash}"
+	local meta_name="Turnip-SmartSpin-50k-GitFixed-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Fixed: 50k Spin Wait Logic. Commit $short_hash",
+  "description": "Turnip Fixed: 50k Spin Wait + Robust Clone. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-SmartSpin-50k-Fixed-${short_hash}.zip"
+	local zip_name="Turnip-SmartSpin-50k-GitFixed-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -300,9 +340,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-SmartSpin-50k-Fixed-${date_tag}-${short_hash}" > tag
-    echo "Turnip (SmartSpin 50k Fixed) - ${date_tag}" > release
-    echo "Corrected compilation error. Includes 50k Spin logic." > description
+    echo "Turnip-SmartSpin-50k-GitFixed-${date_tag}-${short_hash}" > tag
+    echo "Turnip (SmartSpin 50k + Git Fix) - ${date_tag}" > release
+    echo "Includes 50k Spin logic and fixes for HTTP 503 clone errors." > description
 }
 
 check_deps

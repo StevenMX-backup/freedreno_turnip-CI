@@ -58,57 +58,83 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO DE CÓDIGO VIA PYTHON ===
-    echo -e "${green}Injecting Smart Hybrid Wait Logic (via Python)...${nocolor}"
+    # === INJEÇÃO PYTHON: DEVS INSIGHT OPTIMIZATION ===
+    # Substitui toda a lógica lenta de vk_sync_timeline_wait_locked
+    # pela lógica unificada com Spin-Wait.
+    echo -e "${green}Injecting LeeGao/Werman Optimized Wait Logic (Unified Spin)...${nocolor}"
     
 cat << 'EOF_PYTHON' > inject_smart_wait.py
 import re
 import sys
 
-# O novo código híbrido (Busca Precisa + Spin Loop 5000x)
+# Esta lógica substitui os DOIS loops while originais por um único loop inteligente.
+# Baseado na estrutura do vk_sync_timeline.c fornecido.
+
 NEW_CODE = r'''
-   /* SMART HYBRID WAIT INJECTED */
+   /* LEEGAO/WERMAN UNIFIED SPIN WAIT */
+   /* Loop único que trata tanto a espera por submissão quanto por execução */
    while (state->highest_past < wait_value) {
-        struct vk_sync_timeline_point *point = NULL;
+      struct vk_sync_timeline_point *point = NULL;
 
-        /* 1. Busca o ponto exato na lista (Lógica correta) */
-        list_for_each_entry(struct vk_sync_timeline_point, p,
-                            &state->pending_points, link) {
-            if (p->value >= wait_value) {
-                vk_sync_timeline_ref_point_locked(p);
-                point = p;
-                break;
-            }
-        }
+      /* 1. Busca o ponto exato na lista de pendentes */
+      list_for_each_entry(struct vk_sync_timeline_point, p,
+                          &state->pending_points, link) {
+         if (p->value >= wait_value) {
+            vk_sync_timeline_ref_point_locked(p);
+            point = p;
+            break;
+         }
+      }
 
-        /* Se não achar ponto, fallback pro wait genérico (segurança) */
-        if (!point) {
-            int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
-            if (ret == thrd_timedout) return VK_TIMEOUT;
-            if (ret != thrd_success) return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
-            continue;
-        }
+      /* 2. Se o ponto não existe, ele ainda não foi submetido (CPU-side wait) */
+      /* Aqui não podemos fazer spin, pois não há objeto para esperar. Dormimos. */
+      if (!point) {
+         int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
+                                             &abs_timeout_ts);
+         if (ret == thrd_timedout)
+            return VK_TIMEOUT;
 
-        mtx_unlock(&state->mutex);
-        
-        /* 2. SPIN LOOP (Turbo): Tenta 5000x sem dormir no Kernel */
-        VkResult r = VK_NOT_READY;
-        for (int i = 0; i < 5000; i++) {
-             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
-             if (r == VK_SUCCESS) break;
-        }
+         if (ret != thrd_success)
+            return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+         
+         continue; /* Tenta buscar de novo */
+      }
 
-        /* 3. KERNEL WAIT (Fallback): Se o spin falhar, dorme de verdade */
-        if (r != VK_SUCCESS) {
-             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
-        }
+      /* 3. Ponto encontrado! Soltamos o Mutex global para não travar o driver */
+      mtx_unlock(&state->mutex);
 
-        mtx_lock(&state->mutex);
-        vk_sync_timeline_unref_point_locked(device, state, point);
-        
-        if (r != VK_SUCCESS) return r;
-        vk_sync_timeline_complete_point_locked(device, state, point);
+      VkResult result = VK_NOT_READY;
+
+      /* 4. SPINNING AGRESSIVO (50.000 ciclos) */
+      /* Otimizado para DXVK: A maioria dos frames termina em < 2ms. */
+      /* Girar na CPU é mais barato que o context switch do Kernel. */
+      for (int i = 0; i < 50000; i++) {
+          result = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
+          if (result == VK_SUCCESS) break;
+          
+          #if defined(__aarch64__)
+          __asm__ volatile("yield");
+          #endif
+      }
+
+      /* 5. FALLBACK: Se o spin falhar (GPU lenta/travada), dorme de verdade */
+      if (result != VK_SUCCESS) {
+          result = vk_sync_wait(device, &point->sync, 0,
+                                VK_SYNC_WAIT_COMPLETE,
+                                abs_timeout_ns);
+      }
+
+      /* Retoma o Mutex global */
+      mtx_lock(&state->mutex);
+      vk_sync_timeline_unref_point_locked(device, state, point);
+
+      if (result != VK_SUCCESS)
+         return result;
+
+      vk_sync_timeline_complete_point_locked(device, state, point);
    }
+
+   return VK_SUCCESS;
 '''
 
 file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
@@ -117,31 +143,38 @@ try:
     with open(file_path, 'r') as f:
         content = f.read()
 
-    # Regex para encontrar o loop while original.
-    pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*?cnd_timedwait failed"\);\s*\}', re.DOTALL)
+    # Regex para capturar TODO o corpo da função de wait, pegando desde o primeiro while
+    # até o final do segundo while.
+    # Baseado no arquivo enviado: começa em "while (state->highest_pending" e vai até o fim do segundo loop.
+    
+    # Padrão: Procure o primeiro while, pegue tudo até o "return VK_SUCCESS;" final da função
+    pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*return VK_SUCCESS;', re.DOTALL)
 
     if pattern.search(content):
+        # Substitui tudo pelo nosso NEW_CODE
         new_content = pattern.sub(NEW_CODE, content)
         with open(file_path, 'w') as f:
             f.write(new_content)
-        print("SUCCESS: Code replaced successfully via Python.")
+        print("SUCCESS: Unified Spin Logic injected.")
     else:
-        print("ERROR: Could not find the target code block to replace.")
+        print("ERROR: Could not match the function body structure.")
+        # Fallback debug
+        print("Start of file content:", content[:200])
         sys.exit(1)
+
 except Exception as e:
     print(f"PYTHON ERROR: {e}")
     sys.exit(1)
 EOF_PYTHON
 
-    # Executa o script Python
     if python3 inject_smart_wait.py; then
-        echo -e "${green}Smart Hybrid Logic injected.${nocolor}"
+        echo -e "${green}Patch applied successfully.${nocolor}"
     else
-        echo -e "${red}Failed to inject logic. Check python script.${nocolor}"
+        echo -e "${red}Patch failed.${nocolor}"
         exit 1
     fi
 
-    # Dependências do SPIRV
+    # Dependências SPIRV
     mkdir -p subprojects
     cd subprojects
     rm -rf spirv-tools spirv-headers
@@ -150,7 +183,7 @@ EOF_PYTHON
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="MesaMain-SmartHybrid-Fixed"
+	version_str="Turnip-TimelineFix-50kSpin"
 	cd "$workdir"
 }
 
@@ -183,25 +216,14 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
+	# O3 + LTO para maximizar a velocidade do loop de spin
 	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 
-    # === FIX MESON SETUP ===
+    # === MESON FIX (Garante que acha o source) ===
     cd "$source_dir"
-    
-    # Verifica se estamos no lugar certo
-    if [ ! -f "meson.build" ]; then
-        echo -e "${red}CRITICAL ERROR: meson.build not found in $(pwd)!${nocolor}"
-        ls -la
-        exit 1
-    fi
-
-    # Limpa build anterior para evitar confusão
     rm -rf "$build_dir"
-
-    echo "Running Meson Setup..."
-    # SINTAXE CORRIGIDA: meson setup <build_dir> <source_dir>
-    # Explicitamos "." como source dir para evitar o erro "Neither source directory..."
+    
 	meson setup "$build_dir" . --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
@@ -243,19 +265,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="MesaMain-SmartHybrid-Fixed-${short_hash}"
+	local meta_name="Turnip-TimelineFix-50kSpin-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Mesa Main + Smart Hybrid Wait (Python Injected + Meson Fix). Commit $short_hash",
+  "description": "Turnip Optimized: Unified Timeline Wait + 50k Spin Loop. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="MesaMain-SmartHybrid-Fixed-${short_hash}.zip"
+	local zip_name="Turnip-TimelineFix-50kSpin-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -266,9 +288,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "MesaMain-SmartHybrid-Fixed-${date_tag}-${short_hash}" > tag
-    echo "Mesa Main (Smart Hybrid) - ${date_tag}" > release
-    echo "Corrected Meson setup command. Includes Smart Hybrid Wait logic." > description
+    echo "Turnip-TimelineFix-50kSpin-${date_tag}-${short_hash}" > tag
+    echo "Turnip (Unified Spin Fix) - ${date_tag}" > release
+    echo "Optimized logic: Replaces generic Wait with Unified 50k Spin Wait." > description
 }
 
 check_deps

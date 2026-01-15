@@ -5,12 +5,15 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
-deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
+deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator patch"
 workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
+hacks_repo="https://github.com/whitebelyash/mesa-tu8.git"
+hacks_branch="gen8"
+bad_commit="2f0ea1c6"
 
 commit_hash=""
 version_str=""
@@ -47,201 +50,64 @@ prepare_ndk(){
 }
 
 prepare_source(){
-	echo "Preparing Mesa source (Main)..."
+	echo "Preparing Mesa source..."
 	cd "$workdir"
 	if [ -d mesa ]; then rm -rf mesa; fi
 	
-    # Configurações do Git para evitar erro HTTP 503 / RPC Failed
-    git config --global http.postBuffer 1048576000
-    git config --global http.lowSpeedLimit 0
-    git config --global http.lowSpeedTime 999999
-
-    echo "Cloning Official Mesa Main (Robust Mode)..."
-    
-    # Tentativa de clone com retry e otimização de tamanho (Blobless clone)
-    # --filter=blob:none reduz drasticamente o tamanho do download
-    count=0
-    until [ "$count" -ge 5 ]; do
-        if git clone --depth 1 --filter=blob:none "$base_repo" mesa; then
-            break
-        fi
-        echo -e "${red}Clone failed (HTTP 503). Retrying in 5 seconds... ($((count+1))/5)${nocolor}"
-        count=$((count+1))
-        rm -rf mesa
-        sleep 5
-    done
-
-    if [ ! -d "mesa" ]; then
-        echo -e "${red}CRITICAL: Failed to clone Mesa after 5 attempts.${nocolor}"
-        exit 1
-    fi
-
+    echo "Cloning Official Mesa..."
+	git clone --depth 100 "$base_repo" mesa
 	cd mesa
     
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO PYTHON SEGURA (FIXED REGEX + 50k SPIN) ===
-    echo -e "${green}Injecting Smart Spin Logic (Safe Replacement)...${nocolor}"
+    echo -e "${green}Fetching Rob Clark MR 39167 (Gen8 Support)...${nocolor}"
+    git fetch "$base_repo" refs/merge-requests/39167/head:mr-39167
+    git checkout mr-39167
     
-cat << 'EOF_PYTHON' > inject_smart_wait.py
-import re
-import sys
-
-# Função substituta completa.
-# Inclui:
-# 1. Busca eficiente (Fast Path)
-# 2. Spin Loop de 50k iterações com yield (Performance Path)
-# 3. Fallback seguro
-
-NEW_FUNCTION = r'''
-static VkResult
-vk_sync_timeline_wait_locked(struct vk_device *device,
-                             struct vk_sync_timeline_state *state,
-                             uint64_t wait_value,
-                             enum vk_sync_wait_flags wait_flags,
-                             uint64_t abs_timeout_ns)
-{
-   struct timespec abs_timeout_ts;
-   timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
-
-   /* 1. FAST PATH: Busca direta do ponto na lista */
-   while (state->highest_past < wait_value) {
-      struct vk_sync_timeline_point *point = NULL;
-
-      list_for_each_entry(struct vk_sync_timeline_point, p,
-                          &state->pending_points, link) {
-         if (p->value >= wait_value) {
-            vk_sync_timeline_ref_point_locked(p);
-            point = p;
-            break;
-         }
-      }
-
-      /* Se point == NULL, o sinal ainda não foi submetido. Wait passivo. */
-      if (!point) {
-         int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
-                                             &abs_timeout_ts);
-         if (ret == thrd_timedout)
-            return VK_TIMEOUT;
-
-         if (ret != thrd_success)
-            return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
-         
-         continue;
-      }
-
-      /* 2. SPIN WAIT: Solta o mutex e gira na CPU (0.5ms) */
-      mtx_unlock(&state->mutex);
-
-      VkResult result = VK_NOT_READY;
-
-      /* 50.000 iterações com yield para não travar o OS */
-      for (int i = 0; i < 50000; i++) {
-          result = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
-          if (result == VK_SUCCESS) break;
-          
-          #if defined(__aarch64__)
-          __asm__ volatile("yield");
-          #endif
-      }
-
-      /* 3. FALLBACK: Se demorar demais, dorme */
-      if (result != VK_SUCCESS) {
-          result = vk_sync_wait(device, &point->sync, 0,
-                                VK_SYNC_WAIT_COMPLETE,
-                                abs_timeout_ns);
-      }
-
-      /* Retoma o lock */
-      mtx_lock(&state->mutex);
-      vk_sync_timeline_unref_point_locked(device, state, point);
-
-      if (result != VK_SUCCESS)
-         return result;
-
-      vk_sync_timeline_complete_point_locked(device, state, point);
-   }
-
-   if (wait_flags & VK_SYNC_WAIT_PENDING)
-      return VK_SUCCESS;
-
-   return vk_sync_timeline_gc_locked(device, state, false);
-}
-'''
-
-file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
-
-try:
-    with open(file_path, 'r') as f:
-        content = f.read()
-
-    # Regex preciso:
-    # Captura a função vk_sync_timeline_wait_locked até o início da próxima função.
-    # Isso evita deletar código vizinho.
+    echo "Fetching Hacks from: $hacks_repo..."
+    git remote add hacks "$hacks_repo"
+    git fetch hacks "$hacks_branch"
     
-    pattern = re.compile(
-        r'(static VkResult\s+vk_sync_timeline_wait_locked\s*\(.*?\).*?)(static VkResult\s+vk_sync_timeline_wait)', 
-        re.DOTALL
-    )
-
-    if pattern.search(content):
-        # Substitui o grupo 1 (função antiga) pelo NEW_FUNCTION, mantendo o grupo 2
-        new_content = pattern.sub(NEW_FUNCTION + r'\n\n\2', content)
-        with open(file_path, 'w') as f:
-            f.write(new_content)
-        print("SUCCESS: Function replaced safely via Python.")
-    else:
-        print("ERROR: Could not find function boundaries.")
-        # Debug:
-        print(content[:300])
-        sys.exit(1)
-
-except Exception as e:
-    print(f"PYTHON ERROR: {e}")
-    sys.exit(1)
-EOF_PYTHON
-
-    if python3 inject_smart_wait.py; then
-        echo -e "${green}Patch applied.${nocolor}"
-    else
-        echo -e "${red}Patch failed.${nocolor}"
-        exit 1
+    echo "Attempting Merge Hacks..."
+    if ! git merge --no-edit "hacks/$hacks_branch" --allow-unrelated-histories; then
+        echo -e "${red}Merge Conflict detected! Resolving by accepting Hacks...${nocolor}"
+        git checkout --theirs .
+        git add .
+        git commit -m "Auto-resolved conflicts by accepting Hacks over MR 39167"
+        echo -e "${green}Conflicts resolved. Hacks applied successfully.${nocolor}"
     fi
 
-    # Dependências SPIRV (Com retry também)
+    # Correções básicas de sintaxe e registros
+    perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
+    sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
+
+    # [REMOVIDO] Patch A6xx Stability (Force Uncached) foi retirado daqui conforme solicitado.
+
+    echo -e "${green}Applying DXVK Fixes...${nocolor}"
+    if git revert --no-edit "$bad_commit" 2>/dev/null; then
+        echo -e "${green}SUCCESS: Reverted commit $bad_commit via Git.${nocolor}"
+    else
+        git revert --abort || true
+        find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip != 8)//g'
+        find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip == 8)//g'
+    fi
+
+    echo "Cloning SPIRV dependencies..."
     mkdir -p subprojects
     cd subprojects
     rm -rf spirv-tools spirv-headers
-    
-    echo "Cloning SPIRV Tools..."
-    count=0
-    until [ "$count" -ge 5 ]; do
-        if git clone --depth 1 --filter=blob:none https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools; then break; fi
-        echo "Retrying SPIRV-Tools..."
-        rm -rf spirv-tools
-        count=$((count+1))
-        sleep 3
-    done
-
-    echo "Cloning SPIRV Headers..."
-    count=0
-    until [ "$count" -ge 5 ]; do
-        if git clone --depth 1 --filter=blob:none https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers; then break; fi
-        echo "Retrying SPIRV-Headers..."
-        rm -rf spirv-headers
-        count=$((count+1))
-        sleep 3
-    done
+    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Tools.git spirv-tools
+    git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-SmartSpin-50k-GitFixed"
+	version_str="Turnip-Gen8-Clean"
 	cd "$workdir"
 }
 
 compile_mesa(){
-	echo -e "${green}Compiling Mesa Main for SDK $target_sdk...${nocolor}"
+	echo -e "${green}Compiling Mesa for SDK $target_sdk...${nocolor}"
 
 	local source_dir="$workdir/mesa"
 	local build_dir="$source_dir/build"
@@ -269,14 +135,12 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	# O3 + LTO
-	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
-	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
+	cd "$source_dir"
+	
+	export CFLAGS="-D__ANDROID__ -Wno-error"
+	export CXXFLAGS="-D__ANDROID__ -Wno-error"
 
-    cd "$source_dir"
-    rm -rf "$build_dir"
-    
-	meson setup "$build_dir" . --cross-file "$cross_file" \
+	meson setup "$build_dir" --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
 		-Dplatform-sdk-version=$target_sdk \
@@ -317,19 +181,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-SmartSpin-50k-GitFixed-${short_hash}"
+	local meta_name="Turnip-Gen8-Clean-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Fixed: 50k Spin Wait + Robust Clone. Commit $short_hash",
+  "description": "Turnip Gen8 Hacks (No A6xx Fix). Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-SmartSpin-50k-GitFixed-${short_hash}.zip"
+	local zip_name="Turnip-Gen8-Clean-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -340,9 +204,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-SmartSpin-50k-GitFixed-${date_tag}-${short_hash}" > tag
-    echo "Turnip (SmartSpin 50k + Git Fix) - ${date_tag}" > release
-    echo "Includes 50k Spin logic and fixes for HTTP 503 clone errors." > description
+    echo "Turnip-Gen8-Clean-${date_tag}-${short_hash}" > tag
+    echo "Turnip (Gen8 Clean) - ${date_tag}" > release
+    echo "Whitebelyash Gen8 hacks without A6xx stability patch." > description
 }
 
 check_deps

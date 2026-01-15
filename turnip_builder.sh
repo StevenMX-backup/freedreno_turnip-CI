@@ -5,13 +5,11 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
-# Adicionei python3 nas dependências
 deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
 workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
-# Usando Mesa Main Limpa
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
 commit_hash=""
@@ -60,7 +58,7 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO DE CÓDIGO VIA PYTHON (À PROVA DE ERROS) ===
+    # === INJEÇÃO DE CÓDIGO VIA PYTHON ===
     echo -e "${green}Injecting Smart Hybrid Wait Logic (via Python)...${nocolor}"
     
 cat << 'EOF_PYTHON' > inject_smart_wait.py
@@ -120,8 +118,6 @@ try:
         content = f.read()
 
     # Regex para encontrar o loop while original.
-    # Procura desde "while (state->highest_pending" até o fechamento da chave "}"
-    # O uso de re.DOTALL faz o ponto (.) casar com quebras de linha.
     pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*?cnd_timedwait failed"\);\s*\}', re.DOTALL)
 
     if pattern.search(content):
@@ -154,7 +150,7 @@ EOF_PYTHON
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="MesaMain-SmartHybrid-Python"
+	version_str="MesaMain-SmartHybrid-Fixed"
 	cd "$workdir"
 }
 
@@ -187,11 +183,26 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	# Mantendo O3: Essencial para que o loop de 5000 repetições seja ultra-rápido (nanossegundos)
 	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 
-	meson setup "$build_dir" --cross-file "$cross_file" \
+    # === FIX MESON SETUP ===
+    cd "$source_dir"
+    
+    # Verifica se estamos no lugar certo
+    if [ ! -f "meson.build" ]; then
+        echo -e "${red}CRITICAL ERROR: meson.build not found in $(pwd)!${nocolor}"
+        ls -la
+        exit 1
+    fi
+
+    # Limpa build anterior para evitar confusão
+    rm -rf "$build_dir"
+
+    echo "Running Meson Setup..."
+    # SINTAXE CORRIGIDA: meson setup <build_dir> <source_dir>
+    # Explicitamos "." como source dir para evitar o erro "Neither source directory..."
+	meson setup "$build_dir" . --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
 		-Dplatform-sdk-version=$target_sdk \
@@ -232,19 +243,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="MesaMain-SmartHybrid-Python-${short_hash}"
+	local meta_name="MesaMain-SmartHybrid-Fixed-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Mesa Main + Smart Hybrid Wait (Python Injected). Commit $short_hash",
+  "description": "Mesa Main + Smart Hybrid Wait (Python Injected + Meson Fix). Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="MesaMain-SmartHybrid-Python-${short_hash}.zip"
+	local zip_name="MesaMain-SmartHybrid-Fixed-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -255,9 +266,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "MesaMain-SmartHybrid-Python-${date_tag}-${short_hash}" > tag
+    echo "MesaMain-SmartHybrid-Fixed-${date_tag}-${short_hash}" > tag
     echo "Mesa Main (Smart Hybrid) - ${date_tag}" > release
-    echo "Clean build (No hacks/fixes) + Smart Hybrid Wait Logic injected via Python." > description
+    echo "Corrected Meson setup command. Includes Smart Hybrid Wait logic." > description
 }
 
 check_deps

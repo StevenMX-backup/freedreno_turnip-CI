@@ -5,11 +5,13 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
+# Adicionei python3 nas dependências
 deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
 workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
+# Usando Mesa Main Limpa
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
 commit_hash=""
@@ -58,21 +60,20 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO DE CÓDIGO VIA PYTHON ===
-    # Mais robusto que 'patch' pois ignora diferenças de espaços em branco
+    # === INJEÇÃO DE CÓDIGO VIA PYTHON (À PROVA DE ERROS) ===
     echo -e "${green}Injecting Smart Hybrid Wait Logic (via Python)...${nocolor}"
     
 cat << 'EOF_PYTHON' > inject_smart_wait.py
 import re
 import sys
 
-# O novo código híbrido (Busca Precisa + Spin Loop)
+# O novo código híbrido (Busca Precisa + Spin Loop 5000x)
 NEW_CODE = r'''
    /* SMART HYBRID WAIT INJECTED */
    while (state->highest_past < wait_value) {
         struct vk_sync_timeline_point *point = NULL;
 
-        /* 1. Busca o ponto exato na lista (Correct Logic) */
+        /* 1. Busca o ponto exato na lista (Lógica correta) */
         list_for_each_entry(struct vk_sync_timeline_point, p,
                             &state->pending_points, link) {
             if (p->value >= wait_value) {
@@ -82,7 +83,7 @@ NEW_CODE = r'''
             }
         }
 
-        /* Se não achar ponto, fallback pro wait genérico */
+        /* Se não achar ponto, fallback pro wait genérico (segurança) */
         if (!point) {
             int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
             if (ret == thrd_timedout) return VK_TIMEOUT;
@@ -92,14 +93,14 @@ NEW_CODE = r'''
 
         mtx_unlock(&state->mutex);
         
-        /* 2. SPIN LOOP (Turbo): Tenta 5000x sem dormir */
+        /* 2. SPIN LOOP (Turbo): Tenta 5000x sem dormir no Kernel */
         VkResult r = VK_NOT_READY;
         for (int i = 0; i < 5000; i++) {
              r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
              if (r == VK_SUCCESS) break;
         }
 
-        /* 3. KERNEL WAIT (Fallback): Se o spin falhar, dorme */
+        /* 3. KERNEL WAIT (Fallback): Se o spin falhar, dorme de verdade */
         if (r != VK_SUCCESS) {
              r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
         }
@@ -114,20 +115,25 @@ NEW_CODE = r'''
 
 file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
 
-with open(file_path, 'r') as f:
-    content = f.read()
+try:
+    with open(file_path, 'r') as f:
+        content = f.read()
 
-# Regex para encontrar o loop while original que contém o u_cnd_monotonic_timedwait
-# Isso captura desde "while (state->highest_pending..." até o fechamento "}"
-pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*?cnd_timedwait failed"\);\s*\}', re.DOTALL)
+    # Regex para encontrar o loop while original.
+    # Procura desde "while (state->highest_pending" até o fechamento da chave "}"
+    # O uso de re.DOTALL faz o ponto (.) casar com quebras de linha.
+    pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*?cnd_timedwait failed"\);\s*\}', re.DOTALL)
 
-if pattern.search(content):
-    new_content = pattern.sub(NEW_CODE, content)
-    with open(file_path, 'w') as f:
-        f.write(new_content)
-    print("SUCCESS: Code replaced successfully.")
-else:
-    print("ERROR: Could not find the target while loop to replace.")
+    if pattern.search(content):
+        new_content = pattern.sub(NEW_CODE, content)
+        with open(file_path, 'w') as f:
+            f.write(new_content)
+        print("SUCCESS: Code replaced successfully via Python.")
+    else:
+        print("ERROR: Could not find the target code block to replace.")
+        sys.exit(1)
+except Exception as e:
+    print(f"PYTHON ERROR: {e}")
     sys.exit(1)
 EOF_PYTHON
 
@@ -135,11 +141,11 @@ EOF_PYTHON
     if python3 inject_smart_wait.py; then
         echo -e "${green}Smart Hybrid Logic injected.${nocolor}"
     else
-        echo -e "${red}Failed to inject logic.${nocolor}"
+        echo -e "${red}Failed to inject logic. Check python script.${nocolor}"
         exit 1
     fi
 
-    echo "Cloning SPIRV dependencies..."
+    # Dependências do SPIRV
     mkdir -p subprojects
     cd subprojects
     rm -rf spirv-tools spirv-headers
@@ -181,7 +187,7 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	# O3 é obrigatório para o Spin-Loop funcionar bem
+	# Mantendo O3: Essencial para que o loop de 5000 repetições seja ultra-rápido (nanossegundos)
 	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 
@@ -251,7 +257,7 @@ generate_release_info() {
 
     echo "MesaMain-SmartHybrid-Python-${date_tag}-${short_hash}" > tag
     echo "Mesa Main (Smart Hybrid) - ${date_tag}" > release
-    echo "Fail-proof build: Smart Hybrid Wait Logic (5000 spins) injected via Python." > description
+    echo "Clean build (No hacks/fixes) + Smart Hybrid Wait Logic injected via Python." > description
 }
 
 check_deps

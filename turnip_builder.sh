@@ -100,82 +100,6 @@ prepare_source(){
     done
     # ===============================================
 
-    echo -e "${green}Applying User's Timeline Wait Patch...${nocolor}"
-    
-cat << 'EOF_PATCH' > timeline_wait.patch
---- a/src/vulkan/runtime/vk_sync_timeline.c
-+++ b/src/vulkan/runtime/vk_sync_timeline.c
-@@ -436,13 +436,36 @@ static VkResult
- vk_sync_timeline_wait_locked(struct vk_device *device,
-                              struct vk_sync_timeline_state *state,
-                              uint64_t wait_value,
-                              enum vk_sync_wait_flags wait_flags,
-                              uint64_t abs_timeout_ns)
- {
-    struct timespec abs_timeout_ts;
-    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
- 
--   /* Wait on the queue_submit condition variable until the timeline has a
--    * time point pending that's at least as high as wait_value.
--    */
--   while (state->highest_pending < wait_value) {
--      int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
--                                          &abs_timeout_ts);
--      if (ret == thrd_timedout)
--         return VK_TIMEOUT;
--
--      if (ret != thrd_success)
--         return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
--   }
-+   /* Wait until the timeline reaches the requested value */
-+   while (state->highest_past < wait_value) {
-+        struct vk_sync_timeline_point *point = NULL;
-+
-+        /* Get the first pending point >= wait_value */
-+        list_for_each_entry(struct vk_sync_timeline_point, p,
-+                            &state->pending_points, link) {
-+            if (p->value >= wait_value) {
-+                vk_sync_timeline_ref_point_locked(p);
-+                point = p;
-+                break;
-+            }
-+        }
-+
-+        if (!point) {
-+            /* Nothing pending, just wait on condition variable */
-+            int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
-+            if (ret == thrd_timedout)
-+                return VK_TIMEOUT;
-+            if (ret != thrd_success)
-+                return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
-+            continue;
-+        }
-+
-+        /* Unlock while waiting on this specific timeline point */
-+        mtx_unlock(&state->mutex);
-+        VkResult r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
-+        mtx_lock(&state->mutex);
-+
-+        vk_sync_timeline_unref_point_locked(device, state, point);
-+        if (r != VK_SUCCESS)
-+            return r;
-+
-+        vk_sync_timeline_complete_point_locked(device, state, point);
-+   }
- 
-    if (wait_flags & VK_SYNC_WAIT_PENDING)
-       return VK_SUCCESS;
- 
-    VkResult result = vk_sync_timeline_gc_locked(device, state, false);
-EOF_PATCH
-
-    if patch -p1 < timeline_wait.patch; then
-        echo -e "${green}SUCCESS: User Wait Patch applied!${nocolor}"
-    else
-        echo -e "${red}ERROR: Failed to apply Wait Patch.${nocolor}"
-        patch -p1 --ignore-whitespace < timeline_wait.patch || exit 1
-    fi
-
     echo -e "${green}Applying DXVK Fixes...${nocolor}"
     if git revert --no-edit "$bad_commit" 2>/dev/null; then
         echo -e "${green}SUCCESS: Reverted commit $bad_commit via Git.${nocolor}"
@@ -194,7 +118,7 @@ EOF_PATCH
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-StabilityWait"
+	version_str="Turnip-Stability-NoWait"
 	cd "$workdir"
 }
 
@@ -273,19 +197,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-StabilityWait-${short_hash}"
+	local meta_name="Turnip-Stability-NoWait-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip (Uncached + Wait Patch). Commit $short_hash",
+  "description": "Turnip (Stability Patch Only). Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-StabilityWait-${short_hash}.zip"
+	local zip_name="Turnip-Stability-NoWait-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -296,9 +220,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-StabilityWait-${date_tag}-${short_hash}" > tag
-    echo "Turnip (Uncached + Wait Patch) - ${date_tag}" > release
-    echo "A6xx Stability Fix (Uncached Memory) + Timeline Wait Patch." > description
+    echo "Turnip-Stability-NoWait-${date_tag}-${short_hash}" > tag
+    echo "Turnip (Stability Patch) - ${date_tag}" > release
+    echo "Gen8 Hacks + A6xx Stability Patch. No custom Wait patch." > description
 }
 
 check_deps

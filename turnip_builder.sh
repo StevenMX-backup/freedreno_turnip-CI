@@ -5,12 +5,11 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
-deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator patch"
+deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
 workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
-# Mesa Main Limpa
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
 commit_hash=""
@@ -59,93 +58,85 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === SMART HYBRID TIMELINE WAIT ===
-    # Lógica: 
-    # 1. Encontra o ponto exato na lista (Tua lógica)
-    # 2. Faz Spin-Loop (5000x) para evitar latência do Kernel
-    # 3. Fallback para Kernel Wait se necessário
-    echo -e "${green}Applying Smart Hybrid Timeline Patch...${nocolor}"
+    # === INJEÇÃO DE CÓDIGO VIA PYTHON ===
+    # Mais robusto que 'patch' pois ignora diferenças de espaços em branco
+    echo -e "${green}Injecting Smart Hybrid Wait Logic (via Python)...${nocolor}"
     
-cat << 'EOF_PATCH' > timeline_smart.patch
---- a/src/vulkan/runtime/vk_sync_timeline.c
-+++ b/src/vulkan/runtime/vk_sync_timeline.c
-@@ -436,13 +436,44 @@ static VkResult
- vk_sync_timeline_wait_locked(struct vk_device *device,
-                              struct vk_sync_timeline_state *state,
-                              uint64_t wait_value,
-                              enum vk_sync_wait_flags wait_flags,
-                              uint64_t abs_timeout_ns)
- {
-    struct timespec abs_timeout_ts;
-    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
- 
--   /* Wait on the queue_submit condition variable until the timeline has a
--    * time point pending that's at least as high as wait_value.
--    */
--   while (state->highest_pending < wait_value) {
--      int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
--                                          &abs_timeout_ts);
--      if (ret == thrd_timedout)
--         return VK_TIMEOUT;
--
--      if (ret != thrd_success)
--         return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
--   }
-+   /* SMART HYBRID WAIT */
-+   while (state->highest_past < wait_value) {
-+        struct vk_sync_timeline_point *point = NULL;
-+
-+        /* 1. Busca o ponto exato na lista (Correct Logic) */
-+        list_for_each_entry(struct vk_sync_timeline_point, p,
-+                            &state->pending_points, link) {
-+            if (p->value >= wait_value) {
-+                vk_sync_timeline_ref_point_locked(p);
-+                point = p;
-+                break;
-+            }
-+        }
-+
-+        /* Se não achar ponto, fallback pro wait genérico */
-+        if (!point) {
-+            int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
-+            if (ret == thrd_timedout) return VK_TIMEOUT;
-+            if (ret != thrd_success) return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
-+            continue;
-+        }
-+
-+        mtx_unlock(&state->mutex);
-+        
-+        /* 2. SPIN LOOP (Turbo): Tenta 5000x sem dormir */
-+        VkResult r = VK_NOT_READY;
-+        for (int i = 0; i < 5000; i++) {
-+             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
-+             if (r == VK_SUCCESS) break;
-+             /* asm("yield"); // Opcional */
-+        }
-+
-+        /* 3. KERNEL WAIT (Fallback): Se o spin falhar, dorme */
-+        if (r != VK_SUCCESS) {
-+             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
-+        }
-+
-+        mtx_lock(&state->mutex);
-+        vk_sync_timeline_unref_point_locked(device, state, point);
-+        
-+        if (r != VK_SUCCESS) return r;
-+        vk_sync_timeline_complete_point_locked(device, state, point);
-+   }
- 
-    if (wait_flags & VK_SYNC_WAIT_PENDING)
-       return VK_SUCCESS;
- 
-    VkResult result = vk_sync_timeline_gc_locked(device, state, false);
-EOF_PATCH
+cat << 'EOF_PYTHON' > inject_smart_wait.py
+import re
+import sys
 
-    if patch -p1 < timeline_smart.patch; then
-        echo -e "${green}SUCCESS: Smart Hybrid Patch applied!${nocolor}"
+# O novo código híbrido (Busca Precisa + Spin Loop)
+NEW_CODE = r'''
+   /* SMART HYBRID WAIT INJECTED */
+   while (state->highest_past < wait_value) {
+        struct vk_sync_timeline_point *point = NULL;
+
+        /* 1. Busca o ponto exato na lista (Correct Logic) */
+        list_for_each_entry(struct vk_sync_timeline_point, p,
+                            &state->pending_points, link) {
+            if (p->value >= wait_value) {
+                vk_sync_timeline_ref_point_locked(p);
+                point = p;
+                break;
+            }
+        }
+
+        /* Se não achar ponto, fallback pro wait genérico */
+        if (!point) {
+            int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
+            if (ret == thrd_timedout) return VK_TIMEOUT;
+            if (ret != thrd_success) return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+            continue;
+        }
+
+        mtx_unlock(&state->mutex);
+        
+        /* 2. SPIN LOOP (Turbo): Tenta 5000x sem dormir */
+        VkResult r = VK_NOT_READY;
+        for (int i = 0; i < 5000; i++) {
+             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
+             if (r == VK_SUCCESS) break;
+        }
+
+        /* 3. KERNEL WAIT (Fallback): Se o spin falhar, dorme */
+        if (r != VK_SUCCESS) {
+             r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
+        }
+
+        mtx_lock(&state->mutex);
+        vk_sync_timeline_unref_point_locked(device, state, point);
+        
+        if (r != VK_SUCCESS) return r;
+        vk_sync_timeline_complete_point_locked(device, state, point);
+   }
+'''
+
+file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
+
+with open(file_path, 'r') as f:
+    content = f.read()
+
+# Regex para encontrar o loop while original que contém o u_cnd_monotonic_timedwait
+# Isso captura desde "while (state->highest_pending..." até o fechamento "}"
+pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*?cnd_timedwait failed"\);\s*\}', re.DOTALL)
+
+if pattern.search(content):
+    new_content = pattern.sub(NEW_CODE, content)
+    with open(file_path, 'w') as f:
+        f.write(new_content)
+    print("SUCCESS: Code replaced successfully.")
+else:
+    print("ERROR: Could not find the target while loop to replace.")
+    sys.exit(1)
+EOF_PYTHON
+
+    # Executa o script Python
+    if python3 inject_smart_wait.py; then
+        echo -e "${green}Smart Hybrid Logic injected.${nocolor}"
     else
-        echo -e "${red}ERROR: Failed to apply Smart Hybrid Patch.${nocolor}"
-        patch -p1 --ignore-whitespace < timeline_smart.patch || exit 1
+        echo -e "${red}Failed to inject logic.${nocolor}"
+        exit 1
     fi
 
     echo "Cloning SPIRV dependencies..."
@@ -157,7 +148,7 @@ EOF_PATCH
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="MesaMain-SmartHybrid-NoHacks"
+	version_str="MesaMain-SmartHybrid-Python"
 	cd "$workdir"
 }
 
@@ -190,9 +181,7 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	cd "$source_dir"
-	
-	# Mantendo O3 para garantir que o Spin-Loop seja rápido
+	# O3 é obrigatório para o Spin-Loop funcionar bem
 	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 
@@ -237,19 +226,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="MesaMain-SmartHybrid-NoHacks-${short_hash}"
+	local meta_name="MesaMain-SmartHybrid-Python-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Mesa Main + Smart Hybrid Wait (No A6xx Fix/Hacks). Commit $short_hash",
+  "description": "Mesa Main + Smart Hybrid Wait (Python Injected). Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="MesaMain-SmartHybrid-NoHacks-${short_hash}.zip"
+	local zip_name="MesaMain-SmartHybrid-Python-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -260,9 +249,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "MesaMain-SmartHybrid-NoHacks-${date_tag}-${short_hash}" > tag
-    echo "Mesa Main (Smart Hybrid Only) - ${date_tag}" > release
-    echo "Pure Main Build + Smart Hybrid Wait. No stability hacks." > description
+    echo "MesaMain-SmartHybrid-Python-${date_tag}-${short_hash}" > tag
+    echo "Mesa Main (Smart Hybrid) - ${date_tag}" > release
+    echo "Fail-proof build: Smart Hybrid Wait Logic (5000 spins) injected via Python." > description
 }
 
 check_deps

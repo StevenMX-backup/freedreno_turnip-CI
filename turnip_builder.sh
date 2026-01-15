@@ -58,25 +58,31 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    # === INJEÇÃO PYTHON: DEVS INSIGHT OPTIMIZATION ===
-    # Substitui toda a lógica lenta de vk_sync_timeline_wait_locked
-    # pela lógica unificada com Spin-Wait.
-    echo -e "${green}Injecting LeeGao/Werman Optimized Wait Logic (Unified Spin)...${nocolor}"
+    # === INJEÇÃO PYTHON SEGURA (FIXED) ===
+    echo -e "${green}Injecting Smart Spin Logic (Safe Replacement)...${nocolor}"
     
 cat << 'EOF_PYTHON' > inject_smart_wait.py
 import re
 import sys
 
-# Esta lógica substitui os DOIS loops while originais por um único loop inteligente.
-# Baseado na estrutura do vk_sync_timeline.c fornecido.
+# Definimos a função INTEIRA para substituir, garantindo que a sintaxe fique correta.
+# Inclui a lógica de Spin de 50k ciclos (0.5ms) com Yield.
 
-NEW_CODE = r'''
-   /* LEEGAO/WERMAN UNIFIED SPIN WAIT */
-   /* Loop único que trata tanto a espera por submissão quanto por execução */
+NEW_FUNCTION = r'''
+static VkResult
+vk_sync_timeline_wait_locked(struct vk_device *device,
+                             struct vk_sync_timeline_state *state,
+                             uint64_t wait_value,
+                             enum vk_sync_wait_flags wait_flags,
+                             uint64_t abs_timeout_ns)
+{
+   struct timespec abs_timeout_ts;
+   timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
+
+   /* 1. LÓGICA HÍBRIDA: Busca o ponto exato na lista (Fast Path) */
    while (state->highest_past < wait_value) {
       struct vk_sync_timeline_point *point = NULL;
 
-      /* 1. Busca o ponto exato na lista de pendentes */
       list_for_each_entry(struct vk_sync_timeline_point, p,
                           &state->pending_points, link) {
          if (p->value >= wait_value) {
@@ -86,8 +92,7 @@ NEW_CODE = r'''
          }
       }
 
-      /* 2. Se o ponto não existe, ele ainda não foi submetido (CPU-side wait) */
-      /* Aqui não podemos fazer spin, pois não há objeto para esperar. Dormimos. */
+      /* Se não achou o ponto, ele não foi submetido. Dorme no Kernel. */
       if (!point) {
          int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex,
                                              &abs_timeout_ts);
@@ -97,17 +102,16 @@ NEW_CODE = r'''
          if (ret != thrd_success)
             return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
          
-         continue; /* Tenta buscar de novo */
+         continue;
       }
 
-      /* 3. Ponto encontrado! Soltamos o Mutex global para não travar o driver */
+      /* 2. SPIN WAIT (Performance Path) */
+      /* Soltamos o mutex global para permitir que a GPU sinalize o ponto */
       mtx_unlock(&state->mutex);
 
       VkResult result = VK_NOT_READY;
 
-      /* 4. SPINNING AGRESSIVO (50.000 ciclos) */
-      /* Otimizado para DXVK: A maioria dos frames termina em < 2ms. */
-      /* Girar na CPU é mais barato que o context switch do Kernel. */
+      /* 50.000 iterações = Aprox 0.5ms. Ideal para segurar frames de 1000fps+ */
       for (int i = 0; i < 50000; i++) {
           result = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, 0);
           if (result == VK_SUCCESS) break;
@@ -117,14 +121,15 @@ NEW_CODE = r'''
           #endif
       }
 
-      /* 5. FALLBACK: Se o spin falhar (GPU lenta/travada), dorme de verdade */
+      /* 3. FALLBACK */
+      /* Se o spin falhar, dorme de verdade */
       if (result != VK_SUCCESS) {
           result = vk_sync_wait(device, &point->sync, 0,
                                 VK_SYNC_WAIT_COMPLETE,
                                 abs_timeout_ns);
       }
 
-      /* Retoma o Mutex global */
+      /* Retoma o lock para limpar o ponto */
       mtx_lock(&state->mutex);
       vk_sync_timeline_unref_point_locked(device, state, point);
 
@@ -134,7 +139,11 @@ NEW_CODE = r'''
       vk_sync_timeline_complete_point_locked(device, state, point);
    }
 
-   return VK_SUCCESS;
+   if (wait_flags & VK_SYNC_WAIT_PENDING)
+      return VK_SUCCESS;
+
+   return vk_sync_timeline_gc_locked(device, state, false);
+}
 '''
 
 file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
@@ -143,23 +152,26 @@ try:
     with open(file_path, 'r') as f:
         content = f.read()
 
-    # Regex para capturar TODO o corpo da função de wait, pegando desde o primeiro while
-    # até o final do segundo while.
-    # Baseado no arquivo enviado: começa em "while (state->highest_pending" e vai até o fim do segundo loop.
-    
-    # Padrão: Procure o primeiro while, pegue tudo até o "return VK_SUCCESS;" final da função
-    pattern = re.compile(r'while\s*\(state->highest_pending\s*<\s*wait_value\)\s*\{.*return VK_SUCCESS;', re.DOTALL)
+    # ESTRATÉGIA SEGURA:
+    # Substituímos tudo desde a definição de 'vk_sync_timeline_wait_locked'
+    # ATÉ (mas sem incluir) a definição da próxima função 'vk_sync_timeline_wait'.
+    # Isso impede que o regex "coma" a função de baixo.
+
+    pattern = re.compile(
+        r'(static VkResult\s+vk_sync_timeline_wait_locked\s*\(.*?\).*?)(static VkResult\s+vk_sync_timeline_wait)', 
+        re.DOTALL
+    )
 
     if pattern.search(content):
-        # Substitui tudo pelo nosso NEW_CODE
-        new_content = pattern.sub(NEW_CODE, content)
+        # Substitui o Grupo 1 (a função antiga) pela NEW_FUNCTION, mantendo o Grupo 2 (a função seguinte)
+        new_content = pattern.sub(NEW_FUNCTION + r'\n\n\2', content)
         with open(file_path, 'w') as f:
             f.write(new_content)
-        print("SUCCESS: Unified Spin Logic injected.")
+        print("SUCCESS: Function replaced cleanly without damaging neighbors.")
     else:
-        print("ERROR: Could not match the function body structure.")
-        # Fallback debug
-        print("Start of file content:", content[:200])
+        print("ERROR: Could not locate function boundaries.")
+        # Debug:
+        print(content[:500])
         sys.exit(1)
 
 except Exception as e:
@@ -168,7 +180,7 @@ except Exception as e:
 EOF_PYTHON
 
     if python3 inject_smart_wait.py; then
-        echo -e "${green}Patch applied successfully.${nocolor}"
+        echo -e "${green}Patch applied.${nocolor}"
     else
         echo -e "${red}Patch failed.${nocolor}"
         exit 1
@@ -183,7 +195,7 @@ EOF_PYTHON
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-TimelineFix-50kSpin"
+	version_str="Turnip-SmartSpin-50k-Fixed"
 	cd "$workdir"
 }
 
@@ -216,14 +228,14 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	# O3 + LTO para maximizar a velocidade do loop de spin
+	# O3 + LTO
 	export CFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error -O3 -flto"
 
-    # === MESON FIX (Garante que acha o source) ===
     cd "$source_dir"
     rm -rf "$build_dir"
     
+    # Meson Setup Corrigido
 	meson setup "$build_dir" . --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
@@ -265,19 +277,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-TimelineFix-50kSpin-${short_hash}"
+	local meta_name="Turnip-SmartSpin-50k-Fixed-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Optimized: Unified Timeline Wait + 50k Spin Loop. Commit $short_hash",
+  "description": "Turnip Fixed: 50k Spin Wait Logic. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-TimelineFix-50kSpin-${short_hash}.zip"
+	local zip_name="Turnip-SmartSpin-50k-Fixed-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -288,9 +300,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-TimelineFix-50kSpin-${date_tag}-${short_hash}" > tag
-    echo "Turnip (Unified Spin Fix) - ${date_tag}" > release
-    echo "Optimized logic: Replaces generic Wait with Unified 50k Spin Wait." > description
+    echo "Turnip-SmartSpin-50k-Fixed-${date_tag}-${short_hash}" > tag
+    echo "Turnip (SmartSpin 50k Fixed) - ${date_tag}" > release
+    echo "Corrected compilation error. Includes 50k Spin logic." > description
 }
 
 check_deps

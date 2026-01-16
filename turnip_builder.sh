@@ -10,9 +10,11 @@ workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
-base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
-hacks_repo="https://github.com/whitebelyash/mesa-tu8.git"
-hacks_branch="gen8"
+
+# Usando diretamente o repo e branch do Whitebelyash
+base_repo="https://github.com/whitebelyash/mesa-tu8.git"
+base_branch="gen8"
+
 bad_commit="2f0ea1c6"
 
 commit_hash=""
@@ -54,40 +56,44 @@ prepare_source(){
 	cd "$workdir"
 	if [ -d mesa ]; then rm -rf mesa; fi
 	
-    echo "Cloning Official Mesa..."
-	git clone --depth 100 "$base_repo" mesa
+    # Clonando diretamente da branch gen8
+    echo -e "${green}Cloning Whitebelyash Mesa (Branch: $base_branch)...${nocolor}"
+	git clone --depth 100 --branch "$base_branch" "$base_repo" mesa
 	cd mesa
     
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
 
-    echo -e "${green}Fetching Rob Clark MR 39167 (Gen8 Support)...${nocolor}"
-    git fetch "$base_repo" refs/merge-requests/39167/head:mr-39167
-    git checkout mr-39167
-    
-    echo "Fetching Hacks from: $hacks_repo..."
-    git remote add hacks "$hacks_repo"
-    git fetch hacks "$hacks_branch"
-    
-    echo "Attempting Merge Hacks..."
-    if ! git merge --no-edit "hacks/$hacks_branch" --allow-unrelated-histories; then
-        echo -e "${red}Merge Conflict detected! Resolving by accepting Hacks...${nocolor}"
-        git checkout --theirs .
-        git add .
-        git commit -m "Auto-resolved conflicts by accepting Hacks over MR 39167"
-        echo -e "${green}Conflicts resolved. Hacks applied successfully.${nocolor}"
-    fi
-
     # Correções básicas de sintaxe e registros
+    echo "Applying common fixes..."
     perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
     sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
 
-    # [REMOVIDO] Patch A6xx Stability (Force Uncached) foi retirado daqui conforme solicitado.
+    # === PATCH A6xx STABILITY (Force Uncached) ===
+    # Reintroduzido: Corrige flickering/crashes em A619/A620/etc
+    echo -e "${green}Applying Patch: A6xx Stability (Disable Cached Memory)...${nocolor}"
+    
+    if [ -f src/freedreno/vulkan/tu_query.cc ]; then
+        sed -i 's/tu_bo_init_new_cached/tu_bo_init_new/g' src/freedreno/vulkan/tu_query.cc
+    fi
+    
+    if [ -f src/freedreno/vulkan/tu_device.cc ]; then
+        sed -i 's/physical_device->has_cached_coherent_memory = .*/physical_device->has_cached_coherent_memory = false;/' src/freedreno/vulkan/tu_device.cc || true
+    fi
+    
+    # Remove a flag VK_MEMORY_PROPERTY_HOST_CACHED_BIT globalmente
+    grep -rl "VK_MEMORY_PROPERTY_HOST_CACHED_BIT" src/freedreno/vulkan/ | while read file; do
+        sed -i 's/dev->physical_device->has_cached_coherent_memory ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0/0/g' "$file" || true
+        sed -i 's/VK_MEMORY_PROPERTY_HOST_CACHED_BIT/0/g' "$file" || true
+    done
+    # ===============================================
 
-    echo -e "${green}Applying DXVK Fixes...${nocolor}"
+    # DXVK Fixes (Revert do commit problemático)
+    echo -e "${green}Checking/Applying DXVK Fixes...${nocolor}"
     if git revert --no-edit "$bad_commit" 2>/dev/null; then
         echo -e "${green}SUCCESS: Reverted commit $bad_commit via Git.${nocolor}"
     else
+        echo -e "${red}Git revert failed (maybe already reverted). Applying manual fix just in case...${nocolor}"
         git revert --abort || true
         find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip != 8)//g'
         find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip == 8)//g'
@@ -102,7 +108,7 @@ prepare_source(){
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-Gen8-Clean"
+	version_str="Turnip-Gen8-A6xxFix"
 	cd "$workdir"
 }
 
@@ -181,19 +187,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-Gen8-Clean-${short_hash}"
+	local meta_name="Turnip-Gen8-A6xxFix-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Gen8 Hacks (No A6xx Fix). Commit $short_hash",
+  "description": "Turnip Gen8 (Whitebelyash) + A6xx Stability Fix. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-Gen8-Clean-${short_hash}.zip"
+	local zip_name="Turnip-Gen8-A6xxFix-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -204,9 +210,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-Gen8-Clean-${date_tag}-${short_hash}" > tag
-    echo "Turnip (Gen8 Clean) - ${date_tag}" > release
-    echo "Whitebelyash Gen8 hacks without A6xx stability patch." > description
+    echo "Turnip-Gen8-A6xxFix-${date_tag}-${short_hash}" > tag
+    echo "Turnip (Gen8 + A6xx Fix) - ${date_tag}" > release
+    echo "Whitebelyash Gen8 branch + A6xx Stability (Uncached) Patch." > description
 }
 
 check_deps

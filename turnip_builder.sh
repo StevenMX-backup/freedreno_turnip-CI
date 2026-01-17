@@ -5,20 +5,15 @@ green='\033[0;32m'
 red='\033[0;31m'
 nocolor='\033[0m'
 
-deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator patch"
+deps="ninja patchelf unzip curl pip flex bison zip git perl glslangValidator python3"
 workdir="$(pwd)/turnip_workdir"
 
 ndkver="android-ndk-r28"
 target_sdk="36"
+base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
-# Usando diretamente o repo e branch do Whitebelyash
-base_repo="https://github.com/whitebelyash/mesa-tu8.git"
-base_branch="gen8"
-
-bad_commit="2f0ea1c6"
-
-commit_hash=""
-version_str=""
+# Versão base para o HUD
+BUILD_VERSION="25.0.0-MX-Gen3"
 
 check_deps(){
 	echo "Checking system dependencies ..."
@@ -52,25 +47,21 @@ prepare_ndk(){
 }
 
 prepare_source(){
-	echo "Preparing Mesa source..."
+	echo "Preparing Mesa source (Main)..."
 	cd "$workdir"
 	if [ -d mesa ]; then rm -rf mesa; fi
 	
-    # Clonando diretamente da branch gen8
-    echo -e "${green}Cloning Whitebelyash Mesa (Branch: $base_branch)...${nocolor}"
-	git clone --depth 100 --branch "$base_branch" "$base_repo" mesa
+    echo "Cloning Official Mesa Main..."
+	git clone --depth 100 "$base_repo" mesa
 	cd mesa
     
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
-
-    # Correções básicas de sintaxe e registros
-    echo "Applying common fixes..."
-    perl -i -p0e 's/(\n\s*a8xx_825)/,$1/s' src/freedreno/common/freedreno_devices.py
-    sed -i '/REG_A8XX_GRAS_UNKNOWN_/d' src/freedreno/common/freedreno_devices.py
+    
+    local short_hash=$(git rev-parse --short HEAD)
+    FULL_VERSION="${BUILD_VERSION}-${short_hash}"
 
     # === PATCH A6xx STABILITY (Force Uncached) ===
-    # Reintroduzido: Corrige flickering/crashes em A619/A620/etc
     echo -e "${green}Applying Patch: A6xx Stability (Disable Cached Memory)...${nocolor}"
     
     if [ -f src/freedreno/vulkan/tu_query.cc ]; then
@@ -86,18 +77,42 @@ prepare_source(){
         sed -i 's/dev->physical_device->has_cached_coherent_memory ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0/0/g' "$file" || true
         sed -i 's/VK_MEMORY_PROPERTY_HOST_CACHED_BIT/0/g' "$file" || true
     done
-    # ===============================================
 
-    # DXVK Fixes (Revert do commit problemático)
-    echo -e "${green}Checking/Applying DXVK Fixes...${nocolor}"
-    if git revert --no-edit "$bad_commit" 2>/dev/null; then
-        echo -e "${green}SUCCESS: Reverted commit $bad_commit via Git.${nocolor}"
-    else
-        echo -e "${red}Git revert failed (maybe already reverted). Applying manual fix just in case...${nocolor}"
-        git revert --abort || true
-        find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip != 8)//g'
-        find src/freedreno/vulkan -name "*.cc" -print0 | xargs -0 sed -i 's/ && (pdevice->info->chip == 8)//g'
-    fi
+    # === CUSTOM VERSIONING (MX HUD) ===
+    echo -e "${green}Applying Custom Versioning ($FULL_VERSION)...${nocolor}"
+    
+    # 1. Criar o header de versão
+    echo "#define TUGEN8_DRV_VERSION \"$FULL_VERSION\"" > src/freedreno/vulkan/tu_version.h
+
+    # 2. Injetar o include no tu_device.cc
+cat << 'EOF_PYTHON' > inject_version.py
+import sys
+
+file_path = 'src/freedreno/vulkan/tu_device.cc'
+try:
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+    
+    new_lines = []
+    include_added = False
+    
+    for line in lines:
+        new_lines.append(line)
+        if not include_added and '#include "tu_device.h"' in line:
+            new_lines.append('#include "tu_version.h"\n')
+            include_added = True
+
+    with open(file_path, 'w') as f:
+        f.writelines(new_lines)
+        
+except Exception as e:
+    print(f"Error injecting include: {e}")
+    sys.exit(1)
+EOF_PYTHON
+    python3 inject_version.py
+
+    # 3. Modificar a string de versão no HUD
+    sed -i 's/snprintf(properties->driverInfo, sizeof(properties->driverInfo),.*/snprintf(properties->driverInfo, sizeof(properties->driverInfo), "Turnip Mesa %s (MX)", TUGEN8_DRV_VERSION);/' src/freedreno/vulkan/tu_device.cc || true
 
     echo "Cloning SPIRV dependencies..."
     mkdir -p subprojects
@@ -108,7 +123,7 @@ prepare_source(){
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="Turnip-Gen8-A6xxFix"
+	version_str="MesaMain-Gen3-MX"
 	cd "$workdir"
 }
 
@@ -143,8 +158,16 @@ EOF
 
 	cd "$source_dir"
 	
-	export CFLAGS="-D__ANDROID__ -Wno-error"
-	export CXXFLAGS="-D__ANDROID__ -Wno-error"
+    # === SNAPDRAGON 8 GEN 3 FLAGS (Cortex-X4) ===
+    # -mcpu=cortex-x4: Ativa instruções específicas do Gen 3 (SVE2, etc).
+    # -O3: Maxima otimização de velocidade.
+    # -flto: Link Time Optimization (reduz overhead de chamadas de função).
+    # -DNDEBUG: Desativa asserts para ganhar performance bruta.
+    
+    CPU_FLAGS="-mcpu=cortex-x4 -O3 -flto -DNDEBUG"
+    
+	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
+	export CXXFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
 
 	meson setup "$build_dir" --cross-file "$cross_file" \
 		-Dbuildtype=release \
@@ -187,19 +210,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="Turnip-Gen8-A6xxFix-${short_hash}"
+	local meta_name="MesaMain-Gen3-MX-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Turnip Gen8 (Whitebelyash) + A6xx Stability Fix. Commit $short_hash",
+  "description": "Mesa Main + A6xx Fix + SD 8Gen3 Optimized. Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="Turnip-Gen8-A6xxFix-${short_hash}.zip"
+	local zip_name="MesaMain-Gen3-MX-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -210,9 +233,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "Turnip-Gen8-A6xxFix-${date_tag}-${short_hash}" > tag
-    echo "Turnip (Gen8 + A6xx Fix) - ${date_tag}" > release
-    echo "Whitebelyash Gen8 branch + A6xx Stability (Uncached) Patch." > description
+    echo "MesaMain-Gen3-MX-${date_tag}-${short_hash}" > tag
+    echo "Mesa Main (Gen3 Optimized) - ${date_tag}" > release
+    echo "Snapdragon 8 Gen 3 Flags (-mcpu=cortex-x4) + A6xx Stability + MX HUD." > description
 }
 
 check_deps

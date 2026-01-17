@@ -12,8 +12,8 @@ ndkver="android-ndk-r28"
 target_sdk="36"
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
-# Versão base para o HUD
-BUILD_VERSION="25.0.0-MX-Gen3"
+# Ajustei o nome da versão
+BUILD_VERSION="25.0.0-MX-HighPerf"
 
 check_deps(){
 	echo "Checking system dependencies ..."
@@ -61,30 +61,11 @@ prepare_source(){
     local short_hash=$(git rev-parse --short HEAD)
     FULL_VERSION="${BUILD_VERSION}-${short_hash}"
 
-    # === PATCH A6xx STABILITY (Force Uncached) ===
-    echo -e "${green}Applying Patch: A6xx Stability (Disable Cached Memory)...${nocolor}"
-    
-    if [ -f src/freedreno/vulkan/tu_query.cc ]; then
-        sed -i 's/tu_bo_init_new_cached/tu_bo_init_new/g' src/freedreno/vulkan/tu_query.cc
-    fi
-    
-    if [ -f src/freedreno/vulkan/tu_device.cc ]; then
-        sed -i 's/physical_device->has_cached_coherent_memory = .*/physical_device->has_cached_coherent_memory = false;/' src/freedreno/vulkan/tu_device.cc || true
-    fi
-    
-    # Remove a flag VK_MEMORY_PROPERTY_HOST_CACHED_BIT globalmente
-    grep -rl "VK_MEMORY_PROPERTY_HOST_CACHED_BIT" src/freedreno/vulkan/ | while read file; do
-        sed -i 's/dev->physical_device->has_cached_coherent_memory ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0/0/g' "$file" || true
-        sed -i 's/VK_MEMORY_PROPERTY_HOST_CACHED_BIT/0/g' "$file" || true
-    done
-
     # === CUSTOM VERSIONING (MX HUD) ===
     echo -e "${green}Applying Custom Versioning ($FULL_VERSION)...${nocolor}"
     
-    # 1. Criar o header de versão
     echo "#define TUGEN8_DRV_VERSION \"$FULL_VERSION\"" > src/freedreno/vulkan/tu_version.h
 
-    # 2. Injetar o include no tu_device.cc
 cat << 'EOF_PYTHON' > inject_version.py
 import sys
 
@@ -111,7 +92,6 @@ except Exception as e:
 EOF_PYTHON
     python3 inject_version.py
 
-    # 3. Modificar a string de versão no HUD
     sed -i 's/snprintf(properties->driverInfo, sizeof(properties->driverInfo),.*/snprintf(properties->driverInfo, sizeof(properties->driverInfo), "Turnip Mesa %s (MX)", TUGEN8_DRV_VERSION);/' src/freedreno/vulkan/tu_device.cc || true
 
     echo "Cloning SPIRV dependencies..."
@@ -123,7 +103,7 @@ EOF_PYTHON
     cd .. 
     
 	commit_hash=$(git rev-parse HEAD)
-	version_str="MesaMain-Gen3-MX"
+	version_str="MesaMain-MX-HighPerf"
 	cd "$workdir"
 }
 
@@ -158,13 +138,12 @@ EOF
 
 	cd "$source_dir"
 	
-    # === SNAPDRAGON 8 GEN 3 FLAGS (Cortex-X4) ===
-    # -mcpu=cortex-x4: Ativa instruções específicas do Gen 3 (SVE2, etc).
-    # -O3: Maxima otimização de velocidade.
-    # -flto: Link Time Optimization (reduz overhead de chamadas de função).
-    # -DNDEBUG: Desativa asserts para ganhar performance bruta.
+    # === FLAGS DE COMPATIBILIDADE E PERFORMANCE ===
+    # Removi -mcpu=cortex-x4 (que causa crash em Adreno 6xx/7xx antigos)
+    # Usei -march=armv8.2-a+crypto: Compatível com Snapdragon 845 em diante e muito rápido.
+    # -O3 e -flto garantem a velocidade máxima.
     
-    CPU_FLAGS="-mcpu=cortex-x4 -O3 -flto -DNDEBUG"
+    CPU_FLAGS="-march=armv8.2-a+crypto -O3 -flto -DNDEBUG"
     
 	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
 	export CXXFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
@@ -210,19 +189,19 @@ package_driver(){
 	mv lib_temp.so "vulkan.ad07XX.so"
 
 	local short_hash=${commit_hash:0:7}
-	local meta_name="MesaMain-Gen3-MX-${short_hash}"
+	local meta_name="MesaMain-MX-HighPerf-${short_hash}"
 	cat <<EOF > meta.json
 {
   "schemaVersion": 1,
   "name": "$meta_name",
-  "description": "Mesa Main + A6xx Fix + SD 8Gen3 Optimized. Commit $short_hash",
+  "description": "Mesa Main + MX HUD + High Perf (Compatible). Commit $short_hash",
   "author": "mesa-ci",
   "driverVersion": "$version_str",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
 
-	local zip_name="MesaMain-Gen3-MX-${short_hash}.zip"
+	local zip_name="MesaMain-MX-HighPerf-${short_hash}.zip"
 	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
 	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
 }
@@ -233,9 +212,9 @@ generate_release_info() {
     local date_tag=$(date +'%Y%m%d')
 	local short_hash=${commit_hash:0:7}
 
-    echo "MesaMain-Gen3-MX-${date_tag}-${short_hash}" > tag
-    echo "Mesa Main (Gen3 Optimized) - ${date_tag}" > release
-    echo "Snapdragon 8 Gen 3 Flags (-mcpu=cortex-x4) + A6xx Stability + MX HUD." > description
+    echo "MesaMain-MX-HighPerf-${date_tag}-${short_hash}" > tag
+    echo "Mesa Main (MX HighPerf) - ${date_tag}" > release
+    echo "High Performance Build (O3/LTO) compatible with most Snapdragons." > description
 }
 
 check_deps

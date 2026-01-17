@@ -1,10 +1,11 @@
-name: Build Turnip
+name: Build Turnip Dual
 
 on:
-  workflow_dispatch: # Botão manual
+  workflow_dispatch: # Botão para iniciar manualmente
   schedule:
-    - cron: '0 */12 * * *' # Roda a cada 12h
+    - cron: '0 */12 * * *' # Executa automaticamente a cada 12 horas
 
+# Permissões necessárias para criar Releases e fazer upload de ficheiros
 permissions:
   contents: write
 
@@ -25,24 +26,25 @@ jobs:
       - name: Tornar o Script Executável
         run: chmod +x turnip_builder.sh
 
-      - name: Compilar Driver
+      - name: Compilar Drivers (Standard + A6xx)
         run: ./turnip_builder.sh
 
       - name: Ler Metadados da Release
         id: meta
         run: |
+          # Lê as informações geradas pelo script para usar na criação da Release
           echo "TAG_NAME=$(cat turnip_workdir/tag)" >> $GITHUB_ENV
           echo "RELEASE_NAME=$(cat turnip_workdir/release)" >> $GITHUB_ENV
-          # CORREÇÃO CRÍTICA: Aceita qualquer ZIP (MesaMain ou Turnip)
-          echo "ZIP_PATH=$(ls turnip_workdir/*.zip | head -n 1)" >> $GITHUB_ENV
 
-      - name: Upload Artifact
+      # Faz o upload de TODOS os zips gerados para a aba "Actions" (Backup)
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: driver-turnip-backup
-          path: ${{ env.ZIP_PATH }}
+          name: Turnip-Drivers-Dual
+          path: turnip_workdir/*.zip
           if-no-files-found: error
 
+      # Cria a Release oficial e anexa os dois drivers
       - name: Publicar Release
         uses: softprops/action-gh-release@v1
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
@@ -50,7 +52,7 @@ jobs:
           tag_name: ${{ env.TAG_NAME }}
           name: ${{ env.RELEASE_NAME }}
           body_path: turnip_workdir/description
-          files: ${{ env.ZIP_PATH }}
+          files: turnip_workdir/*.zip
           draft: false
           prerelease: false
         env:

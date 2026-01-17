@@ -5,7 +5,6 @@ on:
   schedule:
     - cron: '0 */12 * * *' # Roda a cada 12h
 
-# Permissões necessárias para criar Releases
 permissions:
   contents: write
 
@@ -29,24 +28,21 @@ jobs:
       - name: Compilar Driver
         run: ./turnip_builder.sh
 
-      # PASSO CORRIGIDO:
-      # Filtra para pegar apenas o ZIP que começa com "Turnip-"
-      # O '| head -n 1' garante que só uma linha seja passada, evitando erro de formato
       - name: Ler Metadados da Release
         id: meta
         run: |
           echo "TAG_NAME=$(cat turnip_workdir/tag)" >> $GITHUB_ENV
           echo "RELEASE_NAME=$(cat turnip_workdir/release)" >> $GITHUB_ENV
-          echo "ZIP_PATH=$(ls turnip_workdir/Turnip-*.zip | head -n 1)" >> $GITHUB_ENV
+          # CORREÇÃO CRÍTICA: Aceita qualquer ZIP (MesaMain ou Turnip)
+          echo "ZIP_PATH=$(ls turnip_workdir/*.zip | head -n 1)" >> $GITHUB_ENV
 
-      # Faz upload do arquivo como artefato (Backup no Actions)
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: driver-turnip-backup
           path: ${{ env.ZIP_PATH }}
+          if-no-files-found: error
 
-      # Cria a Release oficial na aba "Releases"
       - name: Publicar Release
         uses: softprops/action-gh-release@v1
         if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'

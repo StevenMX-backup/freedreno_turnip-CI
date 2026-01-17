@@ -12,8 +12,8 @@ ndkver="android-ndk-r28"
 target_sdk="36"
 base_repo="https://gitlab.freedesktop.org/mesa/mesa.git"
 
-# Ajustei o nome da versão
-BUILD_VERSION="25.0.0-MX-HighPerf"
+# Versão base
+BASE_VERSION="25.0.0-MX"
 
 check_deps(){
 	echo "Checking system dependencies ..."
@@ -58,41 +58,103 @@ prepare_source(){
     git config user.email "ci@turnip.builder"
     git config user.name "Turnip CI Builder"
     
-    local short_hash=$(git rev-parse --short HEAD)
-    FULL_VERSION="${BUILD_VERSION}-${short_hash}"
-
-    # === CUSTOM VERSIONING (MX HUD) ===
-    echo -e "${green}Applying Custom Versioning ($FULL_VERSION)...${nocolor}"
+    # === APLICAÇÕES COMUNS (Timeline Fix + HUD Base) ===
     
-    echo "#define TUGEN8_DRV_VERSION \"$FULL_VERSION\"" > src/freedreno/vulkan/tu_version.h
-
-cat << 'EOF_PYTHON' > inject_version.py
+    # 1. Timeline Semaphore Optimization (Fast Wait)
+    echo -e "${green}Injecting Optimized Timeline Wait Logic (Common)...${nocolor}"
+cat << 'EOF_PYTHON' > inject_timeline.py
+import re
 import sys
 
+NEW_FUNCTION = r'''
+static VkResult
+vk_sync_timeline_wait_locked(struct vk_device *device,
+                             struct vk_sync_timeline_state *state,
+                             uint64_t wait_value,
+                             enum vk_sync_wait_flags wait_flags,
+                             uint64_t abs_timeout_ns)
+{
+    struct timespec abs_timeout_ts;
+    timespec_from_nsec(&abs_timeout_ts, abs_timeout_ns);
+
+    while (state->highest_past < wait_value) {
+        struct vk_sync_timeline_point *point = NULL;
+        list_for_each_entry(struct vk_sync_timeline_point, p, &state->pending_points, link) {
+            if (p->value >= wait_value) {
+                vk_sync_timeline_ref_point_locked(p);
+                point = p;
+                break;
+            }
+        }
+        if (!point) {
+            int ret = u_cnd_monotonic_timedwait(&state->cond, &state->mutex, &abs_timeout_ts);
+            if (ret == thrd_timedout) return VK_TIMEOUT;
+            if (ret != thrd_success) return vk_errorf(device, VK_ERROR_UNKNOWN, "cnd_timedwait failed");
+            continue;
+        }
+        mtx_unlock(&state->mutex);
+        VkResult r = vk_sync_wait(device, &point->sync, 0, VK_SYNC_WAIT_COMPLETE, abs_timeout_ns);
+        mtx_lock(&state->mutex);
+        vk_sync_timeline_unref_point_locked(device, state, point);
+        if (r != VK_SUCCESS) return r;
+        vk_sync_timeline_complete_point_locked(device, state, point);
+    }
+    return VK_SUCCESS;
+}
+'''
+file_path = 'src/vulkan/runtime/vk_sync_timeline.c'
+try:
+    with open(file_path, 'r') as f: content = f.read()
+    pattern = re.compile(r'(static VkResult\s+vk_sync_timeline_wait_locked\s*\(.*?\).*?)(static VkResult\s+vk_sync_timeline_wait)', re.DOTALL)
+    if pattern.search(content):
+        new_content = pattern.sub(NEW_FUNCTION + r'\n\n\2', content)
+        with open(file_path, 'w') as f: f.write(new_content)
+        print("SUCCESS")
+    else: sys.exit(1)
+except Exception as e: sys.exit(1)
+EOF_PYTHON
+    python3 inject_timeline.py || exit 1
+
+    # 2. HUD Injection Base (Estrutura)
+    echo -e "${green}Injecting HUD Structure (Common)...${nocolor}"
+cat << 'EOF_PYTHON' > inject_hud.py
+import sys
+import re
 file_path = 'src/freedreno/vulkan/tu_device.cc'
 try:
-    with open(file_path, 'r') as f:
-        lines = f.readlines()
+    with open(file_path, 'r') as f: content = f.read()
     
-    new_lines = []
-    include_added = False
-    
-    for line in lines:
-        new_lines.append(line)
-        if not include_added and '#include "tu_device.h"' in line:
-            new_lines.append('#include "tu_version.h"\n')
-            include_added = True
+    # Injeta Includes
+    includes = []
+    if '#include "git_sha1.h"' not in content: includes.append('#include "git_sha1.h"')
+    if '#include "tu_version.h"' not in content: includes.append('#include "tu_version.h"')
+    if includes:
+        content = re.sub(r'(#include ".*"\n)(?!#include)', r'\1' + '\n'.join(includes) + '\n', content, count=1)
 
-    with open(file_path, 'w') as f:
-        f.writelines(new_lines)
-        
-except Exception as e:
-    print(f"Error injecting include: {e}")
-    sys.exit(1)
+    # Injeta Lógica de Nome
+    new_logic = r'''
+   /* Custom HUD Injection (MX) */
+   char devname[128];
+   strcpy(devname, pdevice->name);
+   strcat(devname, " (" MESA_GIT_SHA1 "/" TUGEN8_DRV_VERSION ")");
+   strcpy(props->deviceName, devname);
+'''
+    pattern = re.compile(r'\s*strcpy\(props->deviceName, pdevice->name\);')
+    if pattern.search(content):
+        new_content = pattern.sub(new_logic, content)
+        with open(file_path, 'w') as f: f.write(new_content)
+        print("SUCCESS")
+    else:
+        # Fallback
+        fb_pattern = re.compile(r'(\s*)memcpy\(props->pipelineCacheUUID,')
+        if fb_pattern.search(content):
+             new_content = fb_pattern.sub(new_logic + r'\n\1memcpy(props->pipelineCacheUUID,', content)
+             with open(file_path, 'w') as f: f.write(new_content)
+             print("SUCCESS")
+        else: sys.exit(1)
+except Exception as e: sys.exit(1)
 EOF_PYTHON
-    python3 inject_version.py
-
-    sed -i 's/snprintf(properties->driverInfo, sizeof(properties->driverInfo),.*/snprintf(properties->driverInfo, sizeof(properties->driverInfo), "Turnip Mesa %s (MX)", TUGEN8_DRV_VERSION);/' src/freedreno/vulkan/tu_device.cc || true
+    python3 inject_hud.py || exit 1
 
     echo "Cloning SPIRV dependencies..."
     mkdir -p subprojects
@@ -102,24 +164,30 @@ EOF_PYTHON
     git clone --depth=1 https://github.com/KhronosGroup/SPIRV-Headers.git spirv-headers
     cd .. 
     
-	commit_hash=$(git rev-parse HEAD)
-	version_str="MesaMain-MX-HighPerf"
 	cd "$workdir"
 }
 
-compile_mesa(){
-	echo -e "${green}Compiling Mesa for SDK $target_sdk...${nocolor}"
-
-	local source_dir="$workdir/mesa"
-	local build_dir="$source_dir/build"
+compile_variant(){
+    local variant_name=$1
+    local variant_suffix=$2
+    local build_folder="build-$variant_name"
+    
+    echo -e "${green}=== Building Variant: $variant_name ===${nocolor}"
+    
+    cd "$workdir/mesa"
+    
+    # Atualiza a versão no HUD para esta variante
+    local short_hash=$(git rev-parse --short HEAD)
+    local full_version="v${BASE_VERSION}-${short_hash}-${variant_suffix}"
+    echo "#define TUGEN8_DRV_VERSION \"$full_version\"" > src/freedreno/vulkan/tu_version.h
+    
+    # Prepara cross-file
 	local ndk_bin_path="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
 	local ndk_sysroot_path="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-
     local compiler_ver="35"
     if [ ! -f "$ndk_bin_path/aarch64-linux-android${compiler_ver}-clang" ]; then compiler_ver="34"; fi
-    echo "Using compiler: Clang $compiler_ver"
-
-	local cross_file="$source_dir/android-aarch64-crossfile.txt"
+    
+	local cross_file="$workdir/android-crossfile.txt"
 	cat <<EOF > "$cross_file"
 [binaries]
 ar = '$ndk_bin_path/llvm-ar'
@@ -136,19 +204,13 @@ cpu = 'armv8'
 endian = 'little'
 EOF
 
-	cd "$source_dir"
-	
-    # === FLAGS DE COMPATIBILIDADE E PERFORMANCE ===
-    # Removi -mcpu=cortex-x4 (que causa crash em Adreno 6xx/7xx antigos)
-    # Usei -march=armv8.2-a+crypto: Compatível com Snapdragon 845 em diante e muito rápido.
-    # -O3 e -flto garantem a velocidade máxima.
+    # Configuração Meson
+    export CFLAGS="-D__ANDROID__ -Wno-error"
+    export CXXFLAGS="-D__ANDROID__ -Wno-error"
     
-    CPU_FLAGS="-march=armv8.2-a+crypto -O3 -flto -DNDEBUG"
+    rm -rf "$build_folder"
     
-	export CFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
-	export CXXFLAGS="-D__ANDROID__ -Wno-error $CPU_FLAGS"
-
-	meson setup "$build_dir" --cross-file "$cross_file" \
+	meson setup "$build_folder" --cross-file "$cross_file" \
 		-Dbuildtype=release \
 		-Dplatforms=android \
 		-Dplatform-sdk-version=$target_sdk \
@@ -164,62 +226,74 @@ EOF
         -Dzstd=disabled \
         -Dwerror=false \
         --force-fallback-for=spirv-tools,spirv-headers \
-		2>&1 | tee "$workdir/meson_log"
+		2>&1 | tee "$workdir/meson_${variant_name}.log"
 
-	ninja -C "$build_dir" 2>&1 | tee "$workdir/ninja_log"
-}
-
-package_driver(){
-	local source_dir="$workdir/mesa"
-	local build_dir="$source_dir/build"
-	local lib_path="$build_dir/src/freedreno/vulkan/libvulkan_freedreno.so"
-	local package_temp="$workdir/package_temp"
-
-	if [ ! -f "$lib_path" ]; then
-		echo -e "${red}Build failed: libvulkan_freedreno.so not found.${nocolor}"
+	ninja -C "$build_folder" 2>&1 | tee "$workdir/ninja_${variant_name}.log"
+    
+    # Empacota
+    local lib_path="$build_folder/src/freedreno/vulkan/libvulkan_freedreno.so"
+    if [ ! -f "$lib_path" ]; then
+		echo -e "${red}Build $variant_name failed!${nocolor}"
 		exit 1
 	fi
-
-	rm -rf "$package_temp"
-	mkdir -p "$package_temp"
-	cp "$lib_path" "$package_temp/lib_temp.so"
-
-	cd "$package_temp"
-	patchelf --set-soname "vulkan.adreno.so" lib_temp.so
-	mv lib_temp.so "vulkan.ad07XX.so"
-
-	local short_hash=${commit_hash:0:7}
-	local meta_name="MesaMain-MX-HighPerf-${short_hash}"
-	cat <<EOF > meta.json
+    
+    local package_temp="$workdir/package_temp_$variant_name"
+    rm -rf "$package_temp"
+    mkdir -p "$package_temp"
+    cp "$lib_path" "$package_temp/libvulkan_freedreno.so"
+    cd "$package_temp"
+    patchelf --set-soname "vulkan.adreno.so" libvulkan_freedreno.so
+    mv libvulkan_freedreno.so "vulkan.ad07XX.so"
+    
+    local zip_name="MesaMain-${BASE_VERSION}-${short_hash}-${variant_name}.zip"
+    
+    cat <<EOF > meta.json
 {
   "schemaVersion": 1,
-  "name": "$meta_name",
-  "description": "Mesa Main + MX HUD + High Perf (Compatible). Commit $short_hash",
+  "name": "MesaMain-${BASE_VERSION}-${variant_name}",
+  "description": "Variant: $variant_name. Commit $short_hash",
   "author": "mesa-ci",
-  "driverVersion": "$version_str",
+  "driverVersion": "Mesa Main",
   "libraryName": "vulkan.ad07XX.so"
 }
 EOF
+    zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
+    echo -e "${green}Package Ready: $zip_name${nocolor}"
+}
 
-	local zip_name="MesaMain-MX-HighPerf-${short_hash}.zip"
-	zip -9 "$workdir/$zip_name" "vulkan.ad07XX.so" meta.json
-	echo -e "${green}Package ready: $workdir/$zip_name${nocolor}"
+run_builds(){
+    # 1. BUILD STANDARD (Sem patch A6xx)
+    compile_variant "Standard" "Std"
+    
+    # 2. APLICA FIX A6xx
+    echo -e "${green}Applying A6xx Stability Patch for second build...${nocolor}"
+    cd "$workdir/mesa"
+    
+    if [ -f src/freedreno/vulkan/tu_query.cc ]; then
+        sed -i 's/tu_bo_init_new_cached/tu_bo_init_new/g' src/freedreno/vulkan/tu_query.cc
+    fi
+    if [ -f src/freedreno/vulkan/tu_device.cc ]; then
+        sed -i 's/physical_device->has_cached_coherent_memory = .*/physical_device->has_cached_coherent_memory = false;/' src/freedreno/vulkan/tu_device.cc || true
+    fi
+    grep -rl "VK_MEMORY_PROPERTY_HOST_CACHED_BIT" src/freedreno/vulkan/ | while read file; do
+        sed -i 's/dev->physical_device->has_cached_coherent_memory ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : 0/0/g' "$file" || true
+        sed -i 's/VK_MEMORY_PROPERTY_HOST_CACHED_BIT/0/g' "$file" || true
+    done
+    
+    # 3. BUILD A6XX FIXED
+    compile_variant "A6xxFix" "A6xx"
 }
 
 generate_release_info() {
-    echo -e "${green}Generating release info...${nocolor}"
     cd "$workdir"
     local date_tag=$(date +'%Y%m%d')
-	local short_hash=${commit_hash:0:7}
-
-    echo "MesaMain-MX-HighPerf-${date_tag}-${short_hash}" > tag
-    echo "Mesa Main (MX HighPerf) - ${date_tag}" > release
-    echo "High Performance Build (O3/LTO) compatible with most Snapdragons." > description
+    echo "Turnip-MX-DualBuild-${date_tag}" > tag
+    echo "Turnip MX Dual (Standard + A6xx) - ${date_tag}" > release
+    echo "Contains two drivers: Standard (High Perf) and A6xxFix (Stability)." > description
 }
 
 check_deps
 prepare_ndk
 prepare_source
-compile_mesa
-package_driver
+run_builds
 generate_release_info
